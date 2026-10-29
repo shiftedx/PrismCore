@@ -10,6 +10,21 @@ source-compatible.)
 
 ### Fixed
 
+- **Explicit dual-track Profile 7 Matroska files now have a native fallback.**
+  A legacy disc layout can carry the HDR10 base layer on one HEVC track and
+  its RPU/enhancement data on a second; treating a nearby HEVC stream as that
+  companion would risk attaching another title's metadata. PrismCore now
+  accepts only exactly two non-cover video tracks with complementary P7/level/
+  compatibility-6 records, pairs their access units by normalized PTS within
+  bounded storage, converts the real RPU to 8.1, and drops the real EL NALs.
+  Missing, duplicate, shifted, malformed, inline-P7, or oversized pair state
+  fails as the typed `invalidDolbyVisionConversion` error; an ambiguous layout
+  remains unconverted. This is metadata conversion plus EL omission, not full
+  FEL reconstruction.
+- **A producer failure is observable before its watcher reaches the session
+  actor.** `remuxFailure` now reads the producer's already-locked terminal
+  error as well as the actor cache, and teardown no longer publishes a stale
+  terminal event into a stopped session.
 - **Profile 7 conversion statistics now include the final segment.** The
   remuxer refreshed its public counters after ordinary keyframe cuts, but the
   EOF tail — including every source shorter than the first target — published

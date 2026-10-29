@@ -254,6 +254,9 @@ final class HLSRemuxer: @unchecked Sendable {
         /// The video codec can't ride AVPlayer's HLS-fMP4 pipeline (VP9,
         /// MPEG-2, …) — the caller should route this source to Prism/libmpv.
         case videoCodecNotNativelyPlayable(String, streamIndex: Int)
+        /// A separately carried P7 EL/RPU stream could not be paired with the
+        /// selected base stream without associating metadata by guesswork.
+        case invalidDolbyVisionConversion
         /// `avformat_open_input` reported success and left no context, or an
         /// adopted one went missing. Not a verdict about anything.
         case openProducedNoContext
@@ -979,6 +982,9 @@ final class HLSRemuxer: @unchecked Sendable {
         // *why* it is routing elsewhere instead of only that it is.
         onStartupPhase?(.streamInfoResolved(info))
         guard let videoTrack = info.video else { throw Failure.noVideoStream }
+        guard !info.hasAmbiguousDolbyVisionSeparateTrack else {
+            throw Failure.invalidDolbyVisionConversion
+        }
         guard videoTrack.copyability == .streamCopy else {
             throw Failure.videoCodecNotNativelyPlayable(videoTrack.codecName, streamIndex: videoTrack.streamIndex)
         }
@@ -1077,7 +1083,31 @@ final class HLSRemuxer: @unchecked Sendable {
         // RPUs to 8.1 and drop the enhancement layer as the packets go past. The
         // converter is nil for every other source (and when libdovi isn't in this
         // build), and then nothing below changes.
-        let dolbyVisionConverter = makeDolbyVisionConverter(video: videoTrack)
+        let separateDolbyVisionPair = info.dolbyVisionSeparateTrackPair
+        let dolbyVisionConverter = makeDolbyVisionConverter(
+            video: videoTrack, separateTrack: separateDolbyVisionPair
+        )
+        let separateDolbyVisionPairer: SeparateTrackDolbyVisionPairer? = {
+            guard let pair = separateDolbyVisionPair, let dolbyVisionConverter else { return nil }
+            return SeparateTrackDolbyVisionPairer(pair: pair, converter: dolbyVisionConverter)
+        }()
+        // A single EL packet can complete more than one queued BL AU when a
+        // muxer wrote the EL track ahead. Drain these before another source
+        // read so the base decode order remains the output decode order.
+        var readySeparatePackets: [SeparateTrackDolbyVisionPairer.Ready] = []
+        // After a seek, B frames can arrive in decode order with presentation
+        // timestamps before the chosen keyframe. Their matching EL was
+        // correctly left before the anchor; keep that presentation floor for
+        // both tracks rather than accepting an unmatched BL after the anchor.
+        var separatePairingMinimumPTS: Int64?
+        func discardReadySeparatePackets() {
+            for ready in readySeparatePackets {
+                var packet: UnsafeMutablePointer<AVPacket>? = ready.packet
+                av_packet_free(&packet)
+            }
+            readySeparatePackets.removeAll(keepingCapacity: true)
+        }
+        defer { discardReadySeparatePackets() }
         // What the manifest may claim: the *converted* configuration when we are
         // converting, the source's own otherwise. Declaring 8.1 for a stream
         // whose RPUs are still P7 would be the one lie AVKit can't detect at
@@ -1958,6 +1988,9 @@ final class HLSRemuxer: @unchecked Sendable {
         func reanchor(to anchor: Int) throws {
             guard let plannedPlan else { return }
             let target = plannedPlan.entries[anchor].startPTS
+            separateDolbyVisionPairer?.reset()
+            discardReadySeparatePackets()
+            separatePairingMinimumPTS = target
             // A seek is a read: over HTTP it is a Range request to the same
             // origin the copy loop reads from, so its failure is a source
             // failure and goes to recovery like one (`reanchorRecovering`).
@@ -2133,6 +2166,20 @@ final class HLSRemuxer: @unchecked Sendable {
                     PrismCoreLog.notice("re-opened source no longer has the same streams; giving up")
                     throw readFailure
                 }
+                if info.dolbyVisionSeparateTrackPair != nil {
+                    // Packet routing for a separate P7 pair is fixed when the
+                    // init segment is built. Codec/time-base equality alone
+                    // cannot prove a replacement URL kept the same DOVI/hvcC
+                    // relationship, so re-describe and reject it rather than
+                    // append one title's RPU to another title's BL.
+                    let reopenedInfo = SourceProbe.describe(input: input)
+                    guard reopenedInfo.video == info.video,
+                          reopenedInfo.dolbyVisionSeparateTrackPair == info.dolbyVisionSeparateTrackPair
+                    else {
+                        PrismCoreLog.notice("re-opened source changed its separate Dolby Vision pair; giving up")
+                        throw readFailure
+                    }
+                }
                 do {
                     try reanchor(to: anchor)
                 } catch let seek as SourceReadFailure {
@@ -2168,13 +2215,28 @@ final class HLSRemuxer: @unchecked Sendable {
         produce: while true {
             reachedEOF = false
             while !cancelled.isSet {
-                // Drained per packet: this loop runs on a plain `Thread` for
-                // the whole session and the thread never drains a pool of its
-                // own, so anything a read callback autoreleases — the
-                // coordinated reader's URL loading, a host's
+                let pairedPacket = !readySeparatePackets.isEmpty
+                    ? readySeparatePackets.removeFirst()
+                    : nil
+                if let pairedPacket {
+                    av_packet_unref(packet)
+                    av_packet_move_ref(packet, pairedPacket.packet)
+                    var packetToFree: UnsafeMutablePointer<AVPacket>? = pairedPacket.packet
+                    av_packet_free(&packetToFree)
+                    try Self.appendHEVCNAL(
+                        pairedPacket.convertedRPU, to: packet, lengthSize: videoTrack.nalUnitLengthSize
+                    )
+                }
+
+                // Drained per source packet: this loop runs on a plain
+                // `Thread` for the whole session and the thread never drains a
+                // pool of its own, so anything a read callback autoreleases —
+                // the coordinated reader's URL loading, a host's
                 // `PrismCoreInput` — would otherwise live until the film ends.
                 // That is how 3.2.1 reached Jetsam on an Apple TV.
-                let readResult = autoreleasepool { av_read_frame(input, packet) }
+                let readResult = pairedPacket == nil
+                    ? autoreleasepool { av_read_frame(input, packet) }
+                    : 0
                 // A demuxer does not always report a failed read. Matroska
                 // resyncs to the next cluster and reads on, so the call
                 // succeeds with a hole behind it — measured on the 30 s
@@ -2185,7 +2247,9 @@ final class HLSRemuxer: @unchecked Sendable {
                 // muxing it. The sequential shape keeps its old behaviour: it
                 // cannot repair anything, and the latched error still ends it
                 // at the end.
-                let latchedReadError = plannedPlan != nil ? input.pointee.pb?.pointee.error ?? 0 : 0
+                let latchedReadError = pairedPacket == nil && plannedPlan != nil
+                    ? input.pointee.pb?.pointee.error ?? 0
+                    : 0
                 if readResult == swift_AVERROR_EOF(), latchedReadError >= 0 {
                     reachedEOF = true
                     break
@@ -2211,12 +2275,14 @@ final class HLSRemuxer: @unchecked Sendable {
                     continue
                 }
                 let readTimeBase = input.pointee.streams[Int(packet.pointee.stream_index)]!.pointee.time_base
-                countSourceBytes(
-                    packet.pointee.size,
-                    ptsSeconds: packet.pointee.pts == swift_AV_NOPTS_VALUE() || readTimeBase.den == 0
-                        ? nil
-                        : Double(packet.pointee.pts) * Double(readTimeBase.num) / Double(readTimeBase.den)
-                )
+                if pairedPacket == nil {
+                    countSourceBytes(
+                        packet.pointee.size,
+                        ptsSeconds: packet.pointee.pts == swift_AV_NOPTS_VALUE() || readTimeBase.den == 0
+                            ? nil
+                            : Double(packet.pointee.pts) * Double(readTimeBase.num) / Double(readTimeBase.den)
+                    )
+                }
                 defer { av_packet_unref(packet) }
 
                 // A fetch outside the producer's window re-anchors it — checked
@@ -2242,12 +2308,24 @@ final class HLSRemuxer: @unchecked Sendable {
                 // the plan's PTS is an indexed keyframe, so it WILL arrive, and
                 // pre-anchor packets belong to a segment nobody asked for.
                 if let target = droppingUntilPTS {
+                    let rawStreamIndex = Int(packet.pointee.stream_index)
                     let isAnchorKeyframe = Int32(packet.pointee.stream_index) == videoIndex
                         && packet.pointee.flags & AV_PKT_FLAG_KEY != 0
                         && packet.pointee.pts != swift_AV_NOPTS_VALUE()
                         && packet.pointee.pts >= target
                     if isAnchorKeyframe {
                         droppingUntilPTS = nil
+                    } else if let pairer = separateDolbyVisionPairer,
+                              rawStreamIndex == pairer.enhancementStreamIndex,
+                              packet.pointee.pts != swift_AV_NOPTS_VALUE(),
+                              av_rescale_q(
+                                  packet.pointee.pts,
+                                  input.pointee.streams[rawStreamIndex]!.pointee.time_base,
+                                  videoTimeBase
+                              ) >= target {
+                        // Keep an EL that belongs to (or follows) the seek
+                        // anchor even when it arrives before its BL. Dropping
+                        // it here would make a valid pair look incomplete.
                     } else {
                         continue
                     }
@@ -2262,6 +2340,21 @@ final class HLSRemuxer: @unchecked Sendable {
                 let streamIndex = Int(packet.pointee.stream_index)
                 let inStream = input.pointee.streams[streamIndex]!
                 let sourceTimeBase = inStream.pointee.time_base
+                let carriedSeparateTrackRPU = pairedPacket != nil
+
+                if !carriedSeparateTrackRPU, let pairer = separateDolbyVisionPairer,
+                   streamIndex == pairer.baseStreamIndex || streamIndex == pairer.enhancementStreamIndex {
+                    if let minimumPTS = separatePairingMinimumPTS,
+                       packet.pointee.pts != swift_AV_NOPTS_VALUE(),
+                       av_rescale_q(packet.pointee.pts, sourceTimeBase, videoTimeBase) < minimumPTS {
+                        continue
+                    }
+                    let ready = try pairer.consume(
+                        packet: packet, streamIndex: streamIndex, timeBase: sourceTimeBase
+                    )
+                    readySeparatePackets.append(contentsOf: ready)
+                    continue
+                }
 
                 if let budget = trueHDAtmosSniff[streamIndex], let data = packet.pointee.data,
                    packet.pointee.size > 0 {
@@ -2349,7 +2442,7 @@ final class HLSRemuxer: @unchecked Sendable {
                     // before the bits reach the muxer. Returns nil for a packet
                     // that needed neither, which is every packet of every other
                     // source — the cost there is one NAL walk, no copy.
-                    if let dolbyVisionConverter, packet.pointee.data != nil,
+                    if let dolbyVisionConverter, !carriedSeparateTrackRPU, packet.pointee.data != nil,
                        packet.pointee.size > 0 {
                         // The walk runs on the packet's own buffer, and a changed
                         // packet is written ONCE into a fresh av_malloc'd buffer
@@ -2447,6 +2540,7 @@ final class HLSRemuxer: @unchecked Sendable {
             // A cancelled session is being torn down, so flushing the encoders would
             // only add work; on EOF the tail is real audio the file has.
             if reachedEOF {
+                try separateDolbyVisionPairer?.finish()
                 if let muxedBridge, let mapped = muxedBridgeIndex.flatMap({ streamMap[Int($0)] }) {
                     try muxedBridge.flush { encoded in
                         try write(encoded, to: mapped, from: muxedBridge.timeBase, writer: writer)
@@ -3140,14 +3234,53 @@ final class HLSRemuxer: @unchecked Sendable {
         packet.pointee.size = Int32(replacementSize)
     }
 
+    /// Put a converted separate-track RPU after the base access unit. The
+    /// Dolby dual-PID carriage puts RPUs with the EL; the single-layer output
+    /// has to carry that RPU with the unchanged BL picture instead.
+    private static func appendHEVCNAL(
+        _ nal: [UInt8], to packet: UnsafeMutablePointer<AVPacket>, lengthSize: Int?
+    ) throws {
+        guard let lengthSize, (1...4).contains(lengthSize), !nal.isEmpty,
+              let data = packet.pointee.data, packet.pointee.size >= 0
+        else { throw Failure.invalidDolbyVisionConversion }
+        let oldSize = Int(packet.pointee.size)
+        let maximumNALSize = (1 << (lengthSize * 8)) - 1
+        guard nal.count <= maximumNALSize,
+              oldSize <= Int(Int32.max) - lengthSize - nal.count
+        else { throw Failure.invalidDolbyVisionConversion }
+        let appendedSize = lengthSize + nal.count
+        let padding = Int(AV_INPUT_BUFFER_PADDING_SIZE)
+        guard let replacement = av_buffer_alloc(oldSize + appendedSize + padding) else {
+            throw FFmpegError(code: -1, operation: "av_buffer_alloc(Dolby Vision RPU)")
+        }
+        _ = memset(replacement.pointee.data.advanced(by: oldSize + appendedSize), 0, padding)
+        replacement.pointee.data.update(from: data, count: oldSize)
+        var cursor = oldSize
+        for shift in stride(from: (lengthSize - 1) * 8, through: 0, by: -8) {
+            replacement.pointee.data[cursor] = UInt8((nal.count >> shift) & 0xFF)
+            cursor += 1
+        }
+        nal.withUnsafeBufferPointer { source in
+            replacement.pointee.data.advanced(by: cursor).update(from: source.baseAddress!, count: source.count)
+        }
+        av_buffer_unref(&packet.pointee.buf)
+        packet.pointee.buf = replacement
+        packet.pointee.data = replacement.pointee.data
+        packet.pointee.size = Int32(oldSize + appendedSize)
+    }
+
     /// A converter for this source, or `nil` when there is nothing to convert.
     ///
     /// Only Profile 7 qualifies. P5 has no HDR10 base to fall back to (its
     /// conversion target would be a different picture, not a different wrapper),
     /// 8.x is already single-layer, and a source with no DV configuration has no
     /// RPUs to rewrite.
-    private func makeDolbyVisionConverter(video: VideoTrackInfo) -> DolbyVisionRPUConverter? {
-        guard let dv = video.dolbyVision, dv.isDualLayer, dv.rpuPresent else { return nil }
+    private func makeDolbyVisionConverter(
+        video: VideoTrackInfo, separateTrack: DolbyVisionSeparateTrackPair?
+    ) -> DolbyVisionRPUConverter? {
+        guard let dv = video.dolbyVision, dv.isDualLayer,
+              dv.rpuPresent || separateTrack?.baseStreamIndex == video.streamIndex
+        else { return nil }
         guard video.hevcConfiguration != nil else { return nil }
         // The prefix width comes from the record itself; a source whose hvcC we
         // couldn't parse never gets here (no `CODECS` string either, so it plays
@@ -3262,6 +3395,179 @@ final class HLSRemuxer: @unchecked Sendable {
             return max(1, Int(Double(size) * 8 / seconds))
         }
         return 25_000_000
+    }
+}
+
+/// Pairs the two explicitly signalled halves of a legacy, separately carried
+/// Profile 7 Matroska stream.  Matroska has no generic "this HEVC track depends
+/// on that one" relationship, so `SourceProbe` only creates this for the two
+/// complementary DOVI records it has already proved.  Packet order is still
+/// untrusted: association is exact presentation time after normalising both
+/// stream time bases, never a nearby packet or a decode-time guess.
+private final class SeparateTrackDolbyVisionPairer {
+    static let maximumBufferedAccessUnits = 256
+    static let maximumBufferedBytes = 32 * 1024 * 1024
+    private static let pairingTimeBase = AVRational(num: 1, den: 1_000_000)
+
+    struct Ready {
+        let packet: UnsafeMutablePointer<AVPacket>
+        let convertedRPU: [UInt8]
+    }
+
+    private struct PendingBase {
+        let pts: Int64
+        let packet: UnsafeMutablePointer<AVPacket>
+        let byteCount: Int
+    }
+
+    private struct PendingEnhancement {
+        let pts: Int64
+        let convertedRPU: [UInt8]
+        let byteCount: Int
+    }
+
+    let baseStreamIndex: Int
+    let enhancementStreamIndex: Int
+    private let baseNALUnitLengthSize: Int
+    private let enhancementNALUnitLengthSize: Int
+    private let converter: DolbyVisionRPUConverter
+    private var bases: [PendingBase] = []
+    private var enhancements: [PendingEnhancement] = []
+    private var bufferedBytes = 0
+
+    init(pair: DolbyVisionSeparateTrackPair, converter: DolbyVisionRPUConverter) {
+        baseStreamIndex = pair.baseStreamIndex
+        enhancementStreamIndex = pair.enhancementStreamIndex
+        baseNALUnitLengthSize = pair.baseNALUnitLengthSize
+        enhancementNALUnitLengthSize = pair.enhancementNALUnitLengthSize
+        self.converter = converter
+    }
+
+    deinit { reset() }
+
+    /// For a normal interleaved pair this holds at most one frame.  A bounded
+    /// look-ahead accommodates muxers that write one track slightly ahead;
+    /// it never lets an unbounded or ambiguous auxiliary stream consume RAM.
+    func consume(
+        packet: UnsafeMutablePointer<AVPacket>, streamIndex: Int, timeBase: AVRational
+    ) throws -> [Ready] {
+        let pts = try normalizedPTS(of: packet, timeBase: timeBase)
+        if streamIndex == baseStreamIndex {
+            try consumeBase(packet, pts: pts)
+            return drainReady()
+        }
+        if streamIndex == enhancementStreamIndex {
+            try consumeEnhancement(packet, pts: pts)
+            return drainReady()
+        }
+        reset()
+        throw HLSRemuxer.Failure.invalidDolbyVisionConversion
+    }
+
+    /// Re-anchors, source reopens and seeks all discard packet history: an AU
+    /// from before a seek must never become the RPU of the new anchor picture.
+    func reset() {
+        for pending in bases {
+            var packet: UnsafeMutablePointer<AVPacket>? = pending.packet
+            av_packet_free(&packet)
+        }
+        bases.removeAll(keepingCapacity: true)
+        enhancements.removeAll(keepingCapacity: true)
+        bufferedBytes = 0
+    }
+
+    /// EOF is a pairing boundary too.  A missing final EL is not harmless just
+    /// because no following packet arrived to expose it.
+    func finish() throws {
+        guard bases.isEmpty, enhancements.isEmpty else {
+            reset()
+            throw HLSRemuxer.Failure.invalidDolbyVisionConversion
+        }
+    }
+
+    private func consumeBase(_ packet: UnsafeMutablePointer<AVPacket>, pts: Int64) throws {
+        guard !bases.contains(where: { $0.pts == pts }) else { throw reject() }
+        try validateBase(packet)
+        guard let copied = av_packet_clone(packet) else {
+            throw FFmpegError(code: -1, operation: "av_packet_clone(Dolby Vision base)")
+        }
+        let byteCount = Int(packet.pointee.size)
+        bases.append(.init(pts: pts, packet: copied, byteCount: byteCount))
+        bufferedBytes += byteCount
+        try enforceBounds()
+    }
+
+    private func validateBase(_ packet: UnsafeMutablePointer<AVPacket>) throws {
+        guard let data = packet.pointee.data, packet.pointee.size > 0 else { throw reject() }
+        let bytes = UnsafeBufferPointer(start: data, count: Int(packet.pointee.size))
+        guard let units = HEVCNALUnits.units(in: bytes, lengthSize: baseNALUnitLengthSize),
+              units.contains(where: { $0.type <= 31 }),
+              !units.contains(where: { $0.type == 62 || $0.type == 63 || $0.layerID != 0 })
+        else { throw reject() }
+    }
+
+    private func consumeEnhancement(
+        _ packet: UnsafeMutablePointer<AVPacket>, pts: Int64
+    ) throws {
+        guard !enhancements.contains(where: { $0.pts == pts }) else { throw reject() }
+        let parsed = try convertEnhancement(packet)
+        enhancements.append(.init(pts: pts, convertedRPU: parsed.convertedRPU, byteCount: parsed.byteCount))
+        bufferedBytes += parsed.byteCount
+        try enforceBounds()
+    }
+
+    /// Always emit from the oldest BL.  This can drain several AUs after a
+    /// leading EL burst, but the caller drains the returned packets before it
+    /// reads another source packet, so audio and video never observe reversed
+    /// decode order.
+    private func drainReady() -> [Ready] {
+        var ready: [Ready] = []
+        while let firstBase = bases.first,
+              let enhancementIndex = enhancements.firstIndex(where: { $0.pts == firstBase.pts }) {
+            let base = bases.removeFirst()
+            let enhancement = enhancements.remove(at: enhancementIndex)
+            bufferedBytes -= base.byteCount + enhancement.byteCount
+            ready.append(.init(packet: base.packet, convertedRPU: enhancement.convertedRPU))
+        }
+        return ready
+    }
+
+    private func convertEnhancement(
+        _ packet: UnsafeMutablePointer<AVPacket>
+    ) throws -> (convertedRPU: [UInt8], byteCount: Int) {
+        guard let data = packet.pointee.data, packet.pointee.size > 0 else { throw reject() }
+        let bytes = UnsafeBufferPointer(start: data, count: Int(packet.pointee.size))
+        guard let units = HEVCNALUnits.units(in: bytes, lengthSize: enhancementNALUnitLengthSize) else {
+            throw reject()
+        }
+        let rpus = units.filter { $0.type == 62 }
+        let discarded = units.filter { $0.type != 62 }
+        guard rpus.count == 1, !discarded.isEmpty,
+              let converted = converter.convertSeparateEnhancementAccessUnit(
+                  rpu: Array(rpus[0].bytes), discardedEnhancementNALCount: discarded.count
+              )
+        else { throw reject() }
+        // The converted RPU is retained while it waits for its BL, so include
+        // it in the bound as well as the borrowed source packet it replaced.
+        return (converted, Int(packet.pointee.size) + converted.count)
+    }
+
+    private func normalizedPTS(of packet: UnsafeMutablePointer<AVPacket>, timeBase: AVRational) throws -> Int64 {
+        guard packet.pointee.pts != swift_AV_NOPTS_VALUE(), timeBase.num > 0, timeBase.den > 0 else {
+            throw reject()
+        }
+        return av_rescale_q(packet.pointee.pts, timeBase, Self.pairingTimeBase)
+    }
+
+    private func enforceBounds() throws {
+        guard bases.count + enhancements.count <= Self.maximumBufferedAccessUnits,
+              bufferedBytes <= Self.maximumBufferedBytes
+        else { throw reject() }
+    }
+
+    private func reject() -> HLSRemuxer.Failure {
+        reset()
+        return .invalidDolbyVisionConversion
     }
 }
 

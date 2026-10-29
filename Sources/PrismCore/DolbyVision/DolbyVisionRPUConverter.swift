@@ -139,6 +139,22 @@ final class DolbyVisionRPUConverter {
         return rewrote
     }
 
+    /// Converts the RPU carried by a separately muxed enhancement access unit.
+    /// The caller counted NALs it will really discard; fabricating an `unspec63`
+    /// count here would make a clean conversion claim meaningless.
+    func convertSeparateEnhancementAccessUnit(
+        rpu: [UInt8], discardedEnhancementNALCount: Int
+    ) -> [UInt8]? {
+        guard discardedEnhancementNALCount > 0 else { return nil }
+        guard let converted = Self.convertRPU(rpu) else {
+            failedRPUs += 1
+            return nil
+        }
+        convertedRPUs += 1
+        droppedEnhancementLayerNALs += discardedEnhancementNALCount
+        return converted
+    }
+
     private func resetPending() {
         pendingConverted = 0
         pendingFailed = 0

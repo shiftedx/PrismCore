@@ -702,6 +702,7 @@ extension PrismCoreError {
         case .noVideoStream: "noVideoStream"
         case .videoCodecNotRemuxable: "videoCodecNotRemuxable"
         case .videoCodecUnplayable: "videoCodecUnplayable"
+        case .invalidDolbyVisionConversion: "invalidDolbyVisionConversion"
         case .startupBudgetExpired: "startupBudgetExpired"
         case .masterRejectedByPlayer: "masterRejectedByPlayer"
         case .workDirectoryOutOfSpace: "workDirectoryOutOfSpace"

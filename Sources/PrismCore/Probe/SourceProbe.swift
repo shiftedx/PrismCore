@@ -467,6 +467,19 @@ public struct VideoTrackInfo: Sendable, Equatable {
     }
 }
 
+/// A Profile 7 base layer and its separately carried enhancement/RPU stream.
+///
+/// This is deliberately a relationship the probe has *proved* from two
+/// complementary Dolby Vision configuration records, rather than a guess that
+/// a second HEVC stream belongs to the selected video.  The remuxer consumes
+/// the enhancement stream; it is never exposed as another playable variant.
+struct DolbyVisionSeparateTrackPair: Sendable, Equatable {
+    let baseStreamIndex: Int
+    let enhancementStreamIndex: Int
+    let baseNALUnitLengthSize: Int
+    let enhancementNALUnitLengthSize: Int
+}
+
 public struct AudioTrackInfo: Sendable, Equatable {
     public let streamIndex: Int
     public let codecName: String
@@ -591,6 +604,13 @@ public struct SourceInfo: Sendable, Equatable {
     /// (some live ingests).
     public let duration: Double?
     public let video: VideoTrackInfo?
+    /// The proven companion stream for a separately-carried Profile 7 RPU/EL,
+    /// when the selected video is its matching base layer.
+    let dolbyVisionSeparateTrackPair: DolbyVisionSeparateTrackPair?
+    /// An explicit BL-only P7 record appeared beside other real video, but the
+    /// probe could not prove the one companion relationship native conversion
+    /// accepts. It is a refusal, not a reason to guess another HEVC title.
+    let hasAmbiguousDolbyVisionSeparateTrack: Bool
     public let audioTracks: [AudioTrackInfo]
     /// Every subtitle stream, text and bitmap alike — the bitmap ones are
     /// reported precisely because PrismCore does *not* carry them (phase 6),
@@ -617,9 +637,31 @@ public struct SourceInfo: Sendable, Equatable {
         chapters: [ChapterInfo] = [],
         hdr10Plus: HDR10PlusFinding? = nil
     ) {
+        self.init(
+            formatName: formatName, duration: duration, video: video,
+            dolbyVisionSeparateTrackPair: nil,
+            hasAmbiguousDolbyVisionSeparateTrack: false,
+            audioTracks: audioTracks, subtitleTracks: subtitleTracks,
+            chapters: chapters, hdr10Plus: hdr10Plus
+        )
+    }
+
+    init(
+        formatName: String,
+        duration: Double?,
+        video: VideoTrackInfo?,
+        dolbyVisionSeparateTrackPair: DolbyVisionSeparateTrackPair?,
+        hasAmbiguousDolbyVisionSeparateTrack: Bool,
+        audioTracks: [AudioTrackInfo],
+        subtitleTracks: [SubtitleTrackInfo],
+        chapters: [ChapterInfo],
+        hdr10Plus: HDR10PlusFinding?
+    ) {
         self.formatName = formatName
         self.duration = duration
         self.video = video
+        self.dolbyVisionSeparateTrackPair = dolbyVisionSeparateTrackPair
+        self.hasAmbiguousDolbyVisionSeparateTrack = hasAmbiguousDolbyVisionSeparateTrack
         self.audioTracks = audioTracks
         self.subtitleTracks = subtitleTracks
         self.chapters = chapters
@@ -631,6 +673,8 @@ public struct SourceInfo: Sendable, Equatable {
     func with(hdr10Plus finding: HDR10PlusFinding?) -> SourceInfo {
         SourceInfo(
             formatName: formatName, duration: duration, video: video,
+            dolbyVisionSeparateTrackPair: dolbyVisionSeparateTrackPair,
+            hasAmbiguousDolbyVisionSeparateTrack: hasAmbiguousDolbyVisionSeparateTrack,
             audioTracks: audioTracks, subtitleTracks: subtitleTracks,
             chapters: chapters, hdr10Plus: finding
         )
@@ -1023,6 +1067,7 @@ public enum SourceProbe {
             : Double(input.pointee.duration) / Double(AV_TIME_BASE)
 
         var video: VideoTrackInfo?
+        var videoTracks: [VideoTrackInfo] = []
         var audio: [AudioTrackInfo] = []
         var subtitles: [SubtitleTrackInfo] = []
 
@@ -1034,9 +1079,13 @@ public enum SourceProbe {
             guard let stream = input.pointee.streams[index] else { continue }
             let par = stream.pointee.codecpar.pointee
             switch par.codec_type {
-            case AVMEDIA_TYPE_VIDEO where Int32(index) == bestVideoIndex:
+            case AVMEDIA_TYPE_VIDEO:
+                // Cover art is technically a video stream to libavformat but
+                // cannot be one half of a Dolby Vision pair or the native
+                // playback picture. Match the server's first-real-video rule.
+                guard stream.pointee.disposition & AV_DISPOSITION_ATTACHED_PIC == 0 else { continue }
                 var verifiedFieldOrder: VideoTrackInfo.FieldOrder?
-                if verifyingInterlace,
+                if Int32(index) == bestVideoIndex, verifyingInterlace,
                    par.codec_id == AV_CODEC_ID_H264,
                    fieldOrder(from: par.field_order).isInterlaced {
                     // Trust the declaration only when decoded frames agree —
@@ -1048,10 +1097,12 @@ public enum SourceProbe {
                         input: input, streamIndex: Int32(index), stream: stream
                     ) ? fieldOrder(from: par.field_order) : .progressive
                 }
-                video = makeVideoInfo(
+                let track = makeVideoInfo(
                     streamIndex: index, stream: stream,
                     verifiedFieldOrder: verifiedFieldOrder
                 )
+                videoTracks.append(track)
+                if Int32(index) == bestVideoIndex { video = track }
             case AVMEDIA_TYPE_AUDIO:
                 audio.append(makeAudioInfo(streamIndex: index, stream: stream))
             case AVMEDIA_TYPE_SUBTITLE:
@@ -1061,14 +1112,85 @@ public enum SourceProbe {
             }
         }
 
+        let separatePair = separateTrackPair(formatName: formatName, allVideoTracks: videoTracks)
+        let ambiguousSeparateTrack = separatePair == nil
+            && videoTracks.count > 1
+            && videoTracks.contains(where: isSeparateTrackBase)
+        if let separatePair,
+           let base = videoTracks.first(where: { $0.streamIndex == separatePair.baseStreamIndex }) {
+            // FFmpeg's best-stream heuristic is allowed to prefer the EL.
+            // The paired layout is only safe when its first real video is the
+            // explicit BL record, so make that same stream the remux target.
+            video = base
+        }
+
         return SourceInfo(
             formatName: formatName,
             duration: duration,
             video: video,
+            dolbyVisionSeparateTrackPair: separatePair,
+            hasAmbiguousDolbyVisionSeparateTrack: ambiguousSeparateTrack,
             audioTracks: audio,
             subtitleTracks: subtitles,
-            chapters: readChapters(input: input)
+            chapters: readChapters(input: input),
+            hdr10Plus: nil
         )
+    }
+
+    /// Recognize only the legacy Matroska layout whose two DOVI records name
+    /// complementary halves of one P7 stream.  Matroska supplies no universal
+    /// dependency identifier: accepting a merely nearby HEVC stream would
+    /// splice another title's metadata into the selected picture.
+    private static func separateTrackPair(
+        formatName: String,
+        allVideoTracks: [VideoTrackInfo]
+    ) -> DolbyVisionSeparateTrackPair? {
+        guard formatName.split(separator: ",").contains("matroska"),
+              allVideoTracks.count == 2,
+              let base = allVideoTracks.first,
+              isSeparateTrackBase(base)
+        else { return nil }
+
+        guard let enhancement = allVideoTracks.first(where: { $0.streamIndex != base.streamIndex }),
+              isSeparateTrackEnhancement(enhancement, for: base),
+              let baseLengthSize = base.nalUnitLengthSize,
+              let lengthSize = enhancement.nalUnitLengthSize
+        else { return nil }
+
+        return .init(
+            baseStreamIndex: base.streamIndex,
+            enhancementStreamIndex: enhancement.streamIndex,
+            baseNALUnitLengthSize: baseLengthSize,
+            enhancementNALUnitLengthSize: lengthSize
+        )
+    }
+
+    private static func isSeparateTrackBase(_ track: VideoTrackInfo) -> Bool {
+        guard track.codecName == "hevc", track.bitDepth == 10,
+              track.hevcConfiguration != nil, track.nalUnitLengthSize != nil,
+              track.frameRate != nil, let dv = track.dolbyVision
+        else { return false }
+        return dv.profile == 7 && dv.level > 0
+            && !dv.rpuPresent && !dv.enhancementLayerPresent && dv.baseLayerPresent
+            && dv.baseLayerSignalCompatibilityID == 6
+    }
+
+    private static func isSeparateTrackEnhancement(
+        _ enhancement: VideoTrackInfo, for base: VideoTrackInfo
+    ) -> Bool {
+        guard enhancement.codecName == "hevc", enhancement.bitDepth == 10,
+              enhancement.hevcConfiguration != nil, enhancement.nalUnitLengthSize != nil,
+              let enhancementRate = enhancement.frameRate, let baseRate = base.frameRate,
+              abs(enhancementRate - baseRate) < 0.001,
+              let baseDV = base.dolbyVision, let enhancementDV = enhancement.dolbyVision
+        else { return false }
+        return enhancementDV.versionMajor == baseDV.versionMajor
+            && enhancementDV.versionMinor == baseDV.versionMinor
+            && enhancementDV.profile == 7
+            && enhancementDV.level == baseDV.level
+            && enhancementDV.rpuPresent && enhancementDV.enhancementLayerPresent
+            && !enhancementDV.baseLayerPresent
+            && enhancementDV.baseLayerSignalCompatibilityID == 6
     }
 
     /// The container's chapter list — `AVChapter`s, which the matroska and mov

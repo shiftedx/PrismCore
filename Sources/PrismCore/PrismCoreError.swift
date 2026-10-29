@@ -68,6 +68,12 @@ public enum PrismCoreError: Error, CustomStringConvertible {
     /// `SoftwareDecoderAvailability`.
     case videoCodecUnplayable(codecName: String)
 
+    /// A separately carried Profile 7 enhancement/RPU stream could not be
+    /// paired with its declared base layer without changing which metadata
+    /// belongs to which picture. The host may retry with its compatible
+    /// non-Dolby-Vision route, but must not retry this same packaging.
+    case invalidDolbyVisionConversion
+
     /// The startup budget ran out with no playable playlist, and the remux
     /// left no error of its own — the source is being read, just not fast
     /// enough (a starving origin, a Matroska without Cues on a slow share).
@@ -135,7 +141,8 @@ public enum PrismCoreError: Error, CustomStringConvertible {
             return status >= 500 ? .retryable : .permanent
 
         // Facts about the bytes. The same source read again is the same source.
-        case .noVideoStream, .videoCodecNotRemuxable, .videoCodecUnplayable:
+        case .noVideoStream, .videoCodecNotRemuxable, .videoCodecUnplayable,
+             .invalidDolbyVisionConversion:
             return .permanent
 
         // Retrying the identical session would be refused identically; the
@@ -171,6 +178,8 @@ public enum PrismCoreError: Error, CustomStringConvertible {
             return "video codec \(codec) (stream \(index)) cannot be stream-copied into fMP4"
         case .videoCodecUnplayable(let codec):
             return "no path in this build can play video codec \(codec)"
+        case .invalidDolbyVisionConversion:
+            return "the Dolby Vision enhancement stream could not be converted safely"
         case .startupBudgetExpired:
             return "the startup budget expired before a playable playlist existed"
         case .masterRejectedByPlayer(let underlying):
@@ -240,6 +249,8 @@ extension PrismCoreError {
             case .noVideoStream: return .noVideoStream
             case .videoCodecNotNativelyPlayable(let codecName, let streamIndex):
                 return .videoCodecNotRemuxable(codecName: codecName, streamIndex: streamIndex)
+            case .invalidDolbyVisionConversion:
+                return .invalidDolbyVisionConversion
             case .openProducedNoContext: return .unknown(underlying: error)
             }
 

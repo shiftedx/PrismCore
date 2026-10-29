@@ -592,7 +592,11 @@ public actor PrismCoreSession {
     /// keeps working); this is the machine-readable read of it. Both are `nil`
     /// until the remux dies.
     public var remuxFailure: PrismCoreError? {
-        remuxError.map(PrismCoreError.classify)
+        // The producer has its terminal error under a lock before the watcher
+        // task hops back to this actor. Reading it here closes the short race
+        // where AVPlayer observes a failed item before that task records the
+        // typed cause.
+        (remuxError ?? (!stopped ? producer?.failureIfAny : nil)).map(PrismCoreError.classify)
     }
 
     /// The display criteria to program before AVPlayer loads this session's
@@ -1992,13 +1996,16 @@ public actor PrismCoreSession {
                 // watcher per producer is what makes this exactly once; a
                 // `stop()` returns the producer normally and has already
                 // closed the stream anyway.
-                await self?.record(error: failure)
-                events.yield(.producerFailed(PrismCoreError.classify(failure)))
+                await self?.recordTerminalFailure(failure, events: events)
             }
         }
     }
 
-    private func record(error: any Error) {
+    private func recordTerminalFailure(_ error: any Error, events: PlaybackEventSink) {
+        // `stop()` is local teardown, not a late producer failure to replay
+        // into a successor host session.
+        guard !stopped else { return }
         remuxError = error
+        events.yield(.producerFailed(PrismCoreError.classify(error)))
     }
 }
