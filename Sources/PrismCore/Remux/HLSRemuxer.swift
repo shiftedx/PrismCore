@@ -2517,6 +2517,14 @@ final class HLSRemuxer: @unchecked Sendable {
             // OLD offset's `audioN/` file of the tail as current; see the
             // same ordering in `emitSegment`.
             if let tailIndex { residentSegments.markProduced(index: tailIndex) }
+            // A short source, or a corrupt RPU in the final partial segment,
+            // has no ordinary boundary through which to publish its conversion
+            // evidence. Publishing only after every tail artifact is produced
+            // keeps a host from certifying a P8.1 master before the bytes it
+            // can fetch have the same accounting.
+            if tailIndex != nil, let dolbyVisionConverter {
+                recordConversionStats(dolbyVisionConverter)
+            }
             // A sub-first-target source cuts here for the first time, so this
             // can be the write the readiness gate is waiting on.
             landed?.broadcast()

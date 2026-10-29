@@ -8,6 +8,16 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Profile 7 conversion statistics now include the final segment.** The
+  remuxer refreshed its public counters after ordinary keyframe cuts, but the
+  EOF tail — including every source shorter than the first target — published
+  media without a refresh. A malformed final RPU could therefore leave a host
+  seeing an earlier clean P8.1 result, or `nil` for a tail-only source. The
+  final snapshot now lands only after that segment and its renditions are
+  fully produced, before loopback availability is signalled.
+
 ## [3.8.1] — 2026-10-20
 
 The loopback server notices when the system takes its listening socket
