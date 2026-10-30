@@ -300,6 +300,9 @@ public actor PrismCoreSession {
         /// a clone, for `sourceURL`'s reason: it names the title, and a
         /// successor is the same title.
         public private(set) var keyframeIndexCacheIdentity: SourceCacheIdentity?
+        /// Server-provided source facts, including a validator-bound external
+        /// keyframe map. Carried unchanged to a successor of the same title.
+        public private(set) var sourceOpenHints: SourceOpenHints?
         public var dialogueBoost: [DialogueBoostLevel]
         /// Which audio rendition is marked DEFAULT, and which track dialogue
         /// boost derives from. No match leaves the source's own order standing.
@@ -661,6 +664,11 @@ public actor PrismCoreSession {
     ///     launches (a local proxy's port and token) and needs no
     ///     `coordinatedHTTP`. A weak or empty `ETag` turns the cache off for
     ///     the source. `nil` (the default) keeps the URL-based identity.
+    ///   - sourceOpenHints: facts supplied by the origin at open time. A
+    ///     complete, validator-bound M2TS keyframe map can avoid a cold scan
+    ///     only when strict dual-PID Dolby Vision validation independently
+    ///     proves its base PID, source length, stream and time base. Bad or
+    ///     stale hints are ignored; they never relax packet-level validation.
     ///   - dialogueBoost: extra "Dialogue Boost" audio renditions to derive
     ///     from the default track, one per level. See the `dialogueBoost`
     ///     doc on the primary initializer.
@@ -674,6 +682,7 @@ public actor PrismCoreSession {
         forceMuxedShape: Bool = false,
         keyframeIndexCacheDirectory: URL? = nil,
         keyframeIndexCacheIdentity: SourceCacheIdentity? = nil,
+        sourceOpenHints: SourceOpenHints? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
         preferredAudioLanguage: String? = nil,
         preferredSubtitleLanguage: String? = nil,
@@ -703,6 +712,7 @@ public actor PrismCoreSession {
             forceMuxedShape: forceMuxedShape,
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             keyframeIndexCacheIdentity: keyframeIndexCacheIdentity,
+            sourceOpenHints: sourceOpenHints,
             dialogueBoost: dialogueBoost,
             preferredAudioLanguage: preferredAudioLanguage,
             preferredSubtitleLanguage: preferredSubtitleLanguage,
@@ -858,6 +868,7 @@ public actor PrismCoreSession {
         probed: ProbedSource? = nil,
         keyframeIndexCacheDirectory: URL? = nil,
         keyframeIndexCacheIdentity: SourceCacheIdentity? = nil,
+        sourceOpenHints: SourceOpenHints? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
         preferredAudioLanguage: String? = nil,
         preferredSubtitleLanguage: String? = nil,
@@ -875,6 +886,10 @@ public actor PrismCoreSession {
         requireDolbyVisionTransportPairing: Bool = false,
         allowsAtmosOutput: Bool = false
     ) throws {
+        // A probe owns the original source-hint request as well as its
+        // evaluated outcome. Preserve it for a successor/recovery open, which
+        // must bind the same external map to freshly observed bytes.
+        let effectiveSourceOpenHints = sourceOpenHints ?? probed?.sourceOpenHints
         self.configuration = Options(
             sourceURL: url,
             httpHeaders: httpHeaders,
@@ -884,6 +899,7 @@ public actor PrismCoreSession {
             forceMuxedShape: forceMuxedShape,
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             keyframeIndexCacheIdentity: keyframeIndexCacheIdentity,
+            sourceOpenHints: effectiveSourceOpenHints,
             dialogueBoost: dialogueBoost,
             preferredAudioLanguage: preferredAudioLanguage,
             preferredSubtitleLanguage: preferredSubtitleLanguage,
@@ -950,6 +966,7 @@ public actor PrismCoreSession {
             input: inputFactory,
             keyframeCacheDirectory: keyframeIndexCacheDirectory,
             hostCacheIdentity: keyframeIndexCacheIdentity,
+            sourceOpenHints: effectiveSourceOpenHints,
             landed: landed,
             subtitleCueHistory: configuration.subtitleCueHistory
         )
@@ -1018,6 +1035,7 @@ public actor PrismCoreSession {
         forceMuxedShape: Bool = false,
         keyframeIndexCacheDirectory: URL? = nil,
         keyframeIndexCacheIdentity: SourceCacheIdentity? = nil,
+        sourceOpenHints: SourceOpenHints? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
         preferredAudioLanguage: String? = nil,
         preferredSubtitleLanguage: String? = nil,
@@ -1043,6 +1061,7 @@ public actor PrismCoreSession {
             forceMuxedShape: forceMuxedShape,
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             keyframeIndexCacheIdentity: keyframeIndexCacheIdentity,
+            sourceOpenHints: sourceOpenHints,
             dialogueBoost: dialogueBoost,
             preferredAudioLanguage: preferredAudioLanguage,
             preferredSubtitleLanguage: preferredSubtitleLanguage,
@@ -1168,6 +1187,7 @@ public actor PrismCoreSession {
             probed: nil,
             keyframeIndexCacheDirectory: options.keyframeIndexCacheDirectory,
             keyframeIndexCacheIdentity: options.keyframeIndexCacheIdentity,
+            sourceOpenHints: options.sourceOpenHints,
             dialogueBoost: options.dialogueBoost,
             preferredAudioLanguage: options.preferredAudioLanguage,
             preferredSubtitleLanguage: options.preferredSubtitleLanguage,

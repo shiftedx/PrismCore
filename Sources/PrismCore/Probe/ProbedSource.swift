@@ -65,6 +65,11 @@ public final class ProbedSource: @unchecked Sendable {
     /// false` for every open that passed none, which is every open today.
     public let hints: HintOutcome
 
+    /// The source facts that produced `hints`. They travel with an adopted
+    /// context so a later recovery open can repeat the same validator-bound
+    /// hint evaluation rather than trusting a conclusion from the old source.
+    let sourceOpenHints: SourceOpenHints?
+
     /// The source this describes, so a consumer that needs to re-open (a
     /// fallback session, whose context was already taken) knows what to open.
     public let url: URL
@@ -103,6 +108,7 @@ public final class ProbedSource: @unchecked Sendable {
         info: SourceInfo,
         structure: SourceStructure = .unknown,
         hints: HintOutcome = .unhinted,
+        sourceOpenHints: SourceOpenHints? = nil,
         url: URL,
         httpHeaders: [String: String],
         inputFactory: PrismCoreInputFactory? = nil,
@@ -113,6 +119,7 @@ public final class ProbedSource: @unchecked Sendable {
         self.info = info
         self.structure = structure
         self.hints = hints
+        self.sourceOpenHints = sourceOpenHints
         self.url = url
         self.httpHeaders = httpHeaders
         self.inputFactory = inputFactory

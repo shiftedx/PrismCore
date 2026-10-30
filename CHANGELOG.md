@@ -10,6 +10,13 @@ source-compatible.)
 
 ### Fixed
 
+- **Strict dual-PID M2TS Dolby Vision can use a server-observed complete
+  keyframe map without cold-scanning the entire title.** The map must be bound
+  to the opened HTTP validator, exact source length, PMT-proven base PID,
+  selected stream/time base, and aligned transport offsets. Re-anchors seek
+  those offsets and still prove the exact BL IRAP and matching EL/RPU before
+  output. Any incomplete, stale, malformed, or mismatched map stays on the
+  bounded scout/sequential path and is never persisted as a local harvest.
 - **Strict dual-PID M2TS Dolby Vision VOD planning no longer assumes its head
   GOP cadence continues through the file.** Cold startup now builds an
   immutable plan only from a bounded, complete sparse proof of real base-layer

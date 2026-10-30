@@ -1079,6 +1079,7 @@ public enum SourceProbe {
 
         return ProbedSource(
             info: info, structure: structure, hints: hintOutcome,
+            sourceOpenHints: hints,
             url: url, httpHeaders: httpHeaders, inputFactory: inputFactory,
             context: input, interruptGuard: interruptGuard,
             timing: ProbeTiming(

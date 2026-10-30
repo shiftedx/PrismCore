@@ -365,6 +365,9 @@ final class HLSRemuxer: @unchecked Sendable {
     /// instance from it — never the probe's, which belongs to the context
     /// that probe opened.
     private let inputFactory: PrismCoreInputFactory?
+    /// Externally observed anchors, bound by the coordinated HTTP reader on
+    /// every open. Only strict M2TS consumes them after PMT validation.
+    private let sourceOpenHints: SourceOpenHints?
 
     /// Set by `cancel()`; checked once per packet in the copy loop.
     private let cancelled = LockedFlag()
@@ -710,6 +713,7 @@ final class HLSRemuxer: @unchecked Sendable {
         input: PrismCoreInputFactory? = nil,
         keyframeCacheDirectory: URL? = nil,
         hostCacheIdentity: SourceCacheIdentity? = nil,
+        sourceOpenHints: SourceOpenHints? = nil,
         indexLoadBudget: Duration = SegmentPlan.indexLoadBudget,
         landed: ProductionSignal? = nil,
         subtitleCueHistory: SubtitleCueHistory = .complete
@@ -719,6 +723,10 @@ final class HLSRemuxer: @unchecked Sendable {
         // a session built from a `ProbedSource` must be able to re-open the
         // same bytes if the context handover has already happened.
         self.inputFactory = input ?? probed?.inputFactory
+        // An adopted probe has already established these facts against the
+        // context we will use. Keep the original request as well: recovery
+        // opens a fresh context and must re-evaluate its validator-bound map.
+        self.sourceOpenHints = sourceOpenHints ?? probed?.sourceOpenHints
         self.landed = landed
         self.keyframeCache = keyframeCacheDirectory.map { KeyframeIndexCache(directory: $0) }
         self.hostCacheIdentity = hostCacheIdentity
@@ -784,7 +792,7 @@ final class HLSRemuxer: @unchecked Sendable {
     ///
     /// Returns `nil` when a `cancel()` ended the open; the context is closed
     /// by then. On success the guard is published as `activeGuard`.
-    private func openSourceContext() throws -> (context: UnsafeMutablePointer<AVFormatContext>, guard: ReadInterruptGuard)? {
+    private func openSourceContext() throws -> (context: UnsafeMutablePointer<AVFormatContext>, guard: ReadInterruptGuard, hints: HintOutcome)? {
         // HTTP(S) inputs carry the caller's headers (a Plex token, a WebDAV
         // authorization) on the demux connection itself, under the shared
         // read caps (see `SourceOpenTuning`).
@@ -799,7 +807,7 @@ final class HLSRemuxer: @unchecked Sendable {
             do { try interruptGuard.installCustomInput(on: input, factory: inputFactory) }
             catch { avformat_free_context(input); throw error }
         } else if coordinatedHTTP, ["http", "https"].contains(sourceURL.scheme?.lowercased() ?? ""), let input {
-            do { try interruptGuard.installHTTPInput(on: input, url: sourceURL, headers: httpHeaders) }
+            do { try interruptGuard.installHTTPInput(on: input, url: sourceURL, headers: httpHeaders, hints: sourceOpenHints) }
             catch { avformat_free_context(input); throw error }
         }
         // Published BEFORE the open, not after it. `cancel()` can only
@@ -862,7 +870,9 @@ final class HLSRemuxer: @unchecked Sendable {
         }
         interruptGuard.disarm()
         guard let input else { throw Failure.openProducedNoContext }
-        return (input, interruptGuard)
+        return (input, interruptGuard, HintEvaluation.evaluate(
+            hints: sourceOpenHints, input: input, interruptGuard: interruptGuard
+        ))
     }
 
     /// One stream as a re-opened context has to repeat it: everything
@@ -915,6 +925,7 @@ final class HLSRemuxer: @unchecked Sendable {
         // `av_interleaved_write_frame`. That is the whole reason this is a
         // handover and not a cache.
         let adoptedInfo: SourceInfo?
+        var hintOutcome: HintOutcome
         // Whichever branch opens (or adopts) the context, the guard is the one
         // its blocking reads were CREATED with — a callback cannot be added to
         // a context after `avformat_open_input` (issue #39), so an adopted
@@ -934,11 +945,13 @@ final class HLSRemuxer: @unchecked Sendable {
             interruptGuard = probed.interruptGuard
             needsRewindToHead = true
             adoptedInfo = probed.info
+            hintOutcome = probed.hints
         } else {
             guard let opened = try openSourceContext() else { return }
             openedInput = opened.context
             interruptGuard = opened.guard
             adoptedInfo = nil
+            hintOutcome = opened.hints
         }
         activeGuardLock.withLock {
             activeGuard = interruptGuard
@@ -1032,6 +1045,30 @@ final class HLSRemuxer: @unchecked Sendable {
             throw Failure.videoCodecNotNativelyPlayable(videoTrack.codecName, streamIndex: videoTrack.streamIndex)
         }
         let videoIndex = Int32(videoTrack.streamIndex)
+        let suppliedM2TSMap: SuppliedKeyframeMap? = {
+            guard requireDolbyVisionTransportPairing,
+                  let association = m2tsAssociation,
+                  let map = hintOutcome.acceptedKeyframes,
+                  map.completeness == .complete,
+                  map.streamIndex == videoIndex,
+                  map.transportPID == Int32(association.basePID),
+                  // A Last-Modified date is sufficient to keep a live range
+                  // read coherent, but not to reuse a server's byte-offset
+                  // assertion after opening. Strict M2TS requires the exact
+                  // strong ETag observed on this context.
+                  let expectedValidator = sourceOpenHints?.expectedValidator,
+                  interruptGuard.openedStrongETag?.tag == expectedValidator,
+                  let sourceSize = map.sourceSize,
+                  let offsets = map.packetOffsets,
+                  offsets.count == map.keyframePTS.count,
+                  let pb = input.pointee.pb,
+                  avio_size(pb) == sourceSize
+            else { return nil }
+            return map
+        }()
+        let suppliedM2TSOffsets = suppliedM2TSMap.map {
+            Dictionary(uniqueKeysWithValues: zip($0.keyframePTS, $0.packetOffsets ?? []))
+        } ?? [:]
 
         // Closed captions ride inside the video, so the only way to know they
         // exist is to look at packets — and it has to happen now, because the
@@ -1308,7 +1345,7 @@ final class HLSRemuxer: @unchecked Sendable {
         // complete sparse *actual* base-layer IRAP segment anchors instead.
         // This is deliberately only current-session evidence: normal packet
         // harvesting remains the sole route that persists a map.
-        var planningKeyframes = cachedKeyframes
+        var planningKeyframes = suppliedM2TSMap?.keyframePTS ?? cachedKeyframes
         let planningCoveredThrough = cachedCoveredThrough
         var scoutRewoundToHead = false
         var observedM2TSPlan: [SegmentPlan.Entry]?
@@ -2189,6 +2226,11 @@ final class HLSRemuxer: @unchecked Sendable {
             } else {
                 localByteBaseline = nil
             }
+            // An externally supplied complete map carries the earliest TS
+            // packet that can furnish the BL IRAP and its same-PTS EL. Seek
+            // there directly; timestamp/PCR seeking is only the fallback for
+            // locally observed plans and can walk a slow transport.
+            let suppliedOffset = suppliedM2TSOffsets[target]
             // Start one planned boundary earlier when possible. MPEG-TS's
             // generic timestamp seek may otherwise choose the next PCR
             // anchor *after* the requested IRAP, leaving no later IRAP in a
@@ -2197,7 +2239,11 @@ final class HLSRemuxer: @unchecked Sendable {
             let seekTarget = requireDolbyVisionTransportPairing && anchor > 0
                 ? plannedPlan.entries[anchor - 1].startPTS
                 : target
-            let sought = av_seek_frame(input, videoIndex, seekTarget, AVSEEK_FLAG_BACKWARD)
+            let sought = if let suppliedOffset {
+                av_seek_frame(input, -1, suppliedOffset, AVSEEK_FLAG_BYTE)
+            } else {
+                av_seek_frame(input, videoIndex, seekTarget, AVSEEK_FLAG_BACKWARD)
+            }
             let interrupted = requireDolbyVisionTransportPairing && interruptGuard.shouldInterrupt
             if sought < 0 || interrupted {
                 clearM2TSLocalSeek()
@@ -2364,7 +2410,7 @@ final class HLSRemuxer: @unchecked Sendable {
                 // Closed, so its host input can go — before the factory is
                 // asked for the next one (`releaseHostInput` says why).
                 retiredGuard.releaseHostInput()
-                let reopened: (context: UnsafeMutablePointer<AVFormatContext>, guard: ReadInterruptGuard)
+                let reopened: (context: UnsafeMutablePointer<AVFormatContext>, guard: ReadInterruptGuard, hints: HintOutcome)
                 do {
                     guard let opened = try openSourceContext() else { return }
                     reopened = opened
@@ -2375,6 +2421,11 @@ final class HLSRemuxer: @unchecked Sendable {
                 openedInput = reopened.context
                 interruptGuard = reopened.guard
                 input = reopened.context
+                hintOutcome = reopened.hints
+                if let suppliedM2TSMap, hintOutcome.acceptedKeyframes != suppliedM2TSMap {
+                    PrismCoreLog.notice("re-opened source no longer validates its supplied M2TS anchor map; giving up")
+                    throw readFailure
+                }
                 guard Self.streamSignatures(of: input) == sourceStreams else {
                     // Not the source the plan, the init segment and the
                     // renditions were built from. Reported as the failure
