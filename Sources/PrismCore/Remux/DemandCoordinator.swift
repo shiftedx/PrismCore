@@ -71,12 +71,18 @@ final class DemandCoordinator: @unchecked Sendable {
 
     /// The newest segment index the provider has served or been asked for —
     /// the closest thing to a playhead the engine can see. `-1` until the
-    /// first media fetch, which is also what lets startup produce freely.
+    /// first media fetch.
     private var lastDemandedIndex = -1
     /// The one before it — what a new request is judged continuous against.
     /// `noteFetch` runs before the miss handling, so by the time a request
     /// is made `lastDemandedIndex` already IS the request.
     private var previousDemandedIndex = -1
+    /// A planned session begins at entry zero even before AVPlayer has fetched
+    /// its first segment. This bounds a fast producer during the handoff from
+    /// `start()` to the player without pretending that a fetch happened: the
+    /// real playhead and its discontinuity history remain unknown until
+    /// `noteFetch` records them.
+    private var startupLeadAnchor: Int?
 
     /// How far past the last demanded segment the producer may run before it
     /// parks, in seconds of content. Thirty seconds: comfortably more than
@@ -100,7 +106,10 @@ final class DemandCoordinator: @unchecked Sendable {
     /// Publish the plan once the producer has built it. Until this, requests
     /// are served from disk only (no pending, no re-anchoring).
     func publish(plan: SegmentPlan) {
-        lock.withLock { self.plan = plan }
+        lock.withLock {
+            self.plan = plan
+            startupLeadAnchor = plan.entries.isEmpty ? nil : 0
+        }
     }
 
     func setProducing(index: Int) {
@@ -182,16 +191,20 @@ final class DemandCoordinator: @unchecked Sendable {
     /// request lands (the copy loop's per-packet check will take it), or the
     /// session is cancelled; the timed wait is only the missed-signal backstop.
     ///
-    /// A `lastDemandedIndex` of `-1` (nothing fetched yet) never parks:
-    /// startup must produce the first segments before AVPlayer has anything
-    /// to ask for. A demand *behind* the producer — a backward seek being
-    /// replayed from disk — parks too: the files are already there, and the
-    /// right move is to wait for the playhead to catch up, not to produce on.
+    /// Before the first fetch, a planned session measures its lead from entry
+    /// zero; that gets the init and opening fragment out, then stops a fast
+    /// source from reading a whole film while the host is still attaching the
+    /// player. An unplanned session has no such stable entry and keeps its
+    /// startup behaviour. A demand *behind* the producer — a backward seek
+    /// being replayed from disk — parks too: the files are already there, and
+    /// the right move is to wait for the playhead to catch up, not to produce
+    /// on.
     func parkWhileAhead(producing: Int, isCancelled: () -> Bool) {
         lock.lock()
         defer { lock.unlock() }
-        while requestedAnchor == nil, !isCancelled(), lastDemandedIndex >= 0,
-              leadSeconds(from: lastDemandedIndex, to: producing) > Self.producerLeadSeconds {
+        while requestedAnchor == nil, !isCancelled(),
+              let leadAnchor = lastDemandedIndex >= 0 ? lastDemandedIndex : startupLeadAnchor,
+              leadSeconds(from: leadAnchor, to: producing) > Self.producerLeadSeconds {
             lock.wait(until: Date(timeIntervalSinceNow: Self.parkBackstopSeconds))
         }
     }
