@@ -10,6 +10,15 @@ source-compatible.)
 
 ### Fixed
 
+- **Strict dual-PID M2TS Dolby Vision can cold-seek without trusting PCR
+  anchors.** A fresh session now makes a bounded head-prefix map from actual
+  base-layer IRAPs, publishes it as a partial VOD plan, and uses timestamp
+  seeking only to locate a candidate. No segment opens until that candidate
+  is an independently decodable BL IRAP with the exact-presentation-time EL
+  RPU; the local read is byte/time bounded and fails through the ordinary
+  source-error path. Warm sessions reuse only packet keys harvested by a
+  producer, never the scout or FFmpeg's transport index. This improves cold
+  deep seeks without claiming a complete keyframe map for the unseen tail.
 - **Explicit dual-PID Profile 7 M2TS can now use the same metadata-only
   fallback as an explicitly paired Matroska source.** PrismCore reads only a
   bounded 192-byte M2TS PSI prefix from its existing input, requires one
