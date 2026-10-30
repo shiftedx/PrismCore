@@ -67,7 +67,9 @@ struct SeparateTrackDolbyVisionTests {
 
         let master = try await session.start()
         let masterText = try await fetchText(master)
-        guard masterText.contains("mp4a.40.2"),
+        guard masterText.contains("#EXT-X-MEDIA:TYPE=AUDIO"),
+              masterText.contains("DEFAULT=YES"),
+              masterText.contains("mp4a.40.2"),
               let audioRelative = PrismCoreSession.playlistURIs(inMaster: masterText).first(where: {
                   $0.hasPrefix("audio")
               }),
