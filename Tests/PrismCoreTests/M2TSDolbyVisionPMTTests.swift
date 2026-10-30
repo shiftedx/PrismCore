@@ -144,8 +144,8 @@ struct M2TSDolbyVisionPMTTests {
         #expect(stats.isClean)
     }
 
-    @Test("M2TS reuses harvested BL keys for an exact forced re-anchor")
-    func harvestedKeyframeMapSupportsReanchor() async throws {
+    @Test("an incomplete M2TS harvest never seeds a later VOD plan")
+    func incompleteHarvestStaysSequential() async throws {
         let source = try #require(
             (ProcessInfo.processInfo.environment["PRISMCORE_DV7_M2TS_FIXTURES"] ?? "")
                 .split(separator: ":").first.map { URL(fileURLWithPath: String($0)) }
@@ -166,7 +166,10 @@ struct M2TSDolbyVisionPMTTests {
         _ = try await materializeToEnd(session: first, master: firstMaster)
         await first.stop()
         let cachedMaps = try FileManager.default.contentsOfDirectory(atPath: cache.path)
-        #expect(!cachedMaps.isEmpty, "first sequential M2TS run did not persist harvested BL keys")
+        // Producer lead limits this first run well before EOF. Those observed packet keys are
+        // valuable only as a contiguous prefix and must not be persisted for strict M2TS VOD:
+        // an unseen variable GOP could otherwise make its inferred tail lie.
+        #expect(cachedMaps.isEmpty, "partial strict-M2TS evidence must not persist")
 
         let replay = try PrismCoreSession(
             url: source,
@@ -178,7 +181,10 @@ struct M2TSDolbyVisionPMTTests {
         )
         defer { Task { await replay.stop() } }
         let master = try await replay.start()
-        #expect((replay.segmentTimeline?.segments.count ?? 0) >= 8)
+        let replayReport = await replay.diagnosticReport()
+        // A small source can independently satisfy the new complete sparse proof on replay;
+        // what must never happen is reviving the partial first-run cache as a VOD plan.
+        #expect(replayReport.startup.planOrigin != SegmentPlanOrigin.keyframeIndexCache.rawValue)
         let masterText = try await fetchText(master)
         guard let relative = PrismCoreSession.playlistURIs(inMaster: masterText).last,
               let media = URL(string: relative, relativeTo: master)?.absoluteURL
@@ -186,9 +192,6 @@ struct M2TSDolbyVisionPMTTests {
         let root = master.deletingLastPathComponent()
         let initBefore = try await fetchData(root.appendingPathComponent("init.mp4"))
         _ = try await fetchData(media.deletingLastPathComponent().appendingPathComponent("seg00000.m4s"))
-        // A tiny cache evicts the head. A tail request must re-anchor from the
-        // harvested packet-key map, not revive the rejected PCR index.
-        _ = try await fetchData(media.deletingLastPathComponent().appendingPathComponent("seg00007.m4s"))
         #expect(try await fetchData(root.appendingPathComponent("init.mp4")) == initBefore)
         #expect((await replay.dolbyVisionConversion)?.isClean == true)
     }

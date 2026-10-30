@@ -48,7 +48,7 @@ struct M2TSColdKeyframeScoutTests {
             interruptGuard: byteStarved.guardBox,
             byteBudget: 1
         )
-        assertNoMap(byteResult)
+        assertInsufficient(byteResult)
 
         var clockStarved = try openFixture()
         defer { avformat_close_input(&clockStarved.context) }
@@ -61,7 +61,23 @@ struct M2TSColdKeyframeScoutTests {
             interruptGuard: clockStarved.guardBox,
             timeBudget: .zero
         )
-        assertNoMap(clockResult)
+        assertInsufficient(clockResult)
+
+        var cancelled = try openFixture()
+        defer { avformat_close_input(&cancelled.context) }
+        let cancelledStream = try #require(cancelled.context?.pointee.streams[1])
+        cancelled.guardBox.cancel()
+        let cancelledResult = M2TSColdKeyframeScout.completeSparsePlan(
+            input: try #require(cancelled.context), baseStreamIndex: 1,
+            timeBase: cancelledStream.pointee.time_base,
+            timelineEndPTS: cancelledStream.pointee.start_time + cancelledStream.pointee.duration,
+            targetSeconds: 6, firstSegmentSeconds: SegmentPlan.defaultFirstSegmentSeconds,
+            interruptGuard: cancelled.guardBox
+        )
+        guard case .cancelled = cancelledResult else {
+            Issue.record("Expected cancellation to remain distinct from an insufficient proof, got \(cancelledResult)")
+            return
+        }
     }
 
     @Test("a host input that dies after open remains an I/O failure")
@@ -98,9 +114,10 @@ struct M2TSColdKeyframeScoutTests {
         #expect(guardBox.customInputFailure != nil)
     }
 
-    private func assertNoMap(_ result: M2TSColdKeyframeScout.CompleteResult) {
-        if case .complete = result {
-            Issue.record("A budget-starved scout published a keyframe map")
+    private func assertInsufficient(_ result: M2TSColdKeyframeScout.CompleteResult) {
+        guard case .insufficient = result else {
+            Issue.record("A budget-starved scout must be insufficient, got \(result)")
+            return
         }
     }
 
