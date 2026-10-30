@@ -1283,7 +1283,7 @@ final class HLSRemuxer: @unchecked Sendable {
         // harvests real packet keyframes; publishing a demand plan from this
         // index created a phantom tail segment that no source keyframe could
         // open. Matroska and ordinary M2TS retain their existing plan policy.
-        let plannedPlan: SegmentPlan? = !requireDolbyVisionTransportPairing
+        let plannedPlan: SegmentPlan? = (!requireDolbyVisionTransportPairing || cachedKeyframes != nil)
             && builtPlan?.basis == .keyframeIndex ? builtPlan : nil
         builtPlanLock.withLock { builtPlanStorage = builtPlan }
         let planIsPartial = plannedPlan != nil && cachedCoveredThrough != nil
@@ -2047,7 +2047,11 @@ final class HLSRemuxer: @unchecked Sendable {
             // A seek is a read: over HTTP it is a Range request to the same
             // origin the copy loop reads from, so its failure is a source
             // failure and goes to recovery like one (`reanchorRecovering`).
-            let sought = av_seek_frame(input, videoIndex, target, AVSEEK_FLAG_BACKWARD)
+            // The strict M2TS map names real packet keyframes, but FFmpeg's
+            // transport seek still follows PCR/index anchors that need not be
+            // pictures. Start at the head and discard to the verified target.
+            let seekTarget = requireDolbyVisionTransportPairing ? 0 : target
+            let sought = av_seek_frame(input, videoIndex, seekTarget, AVSEEK_FLAG_BACKWARD)
             if sought < 0 {
                 throw SourceReadFailure(underlying: sourceFailure(code: sought, operation: "av_seek_frame"))
             }
@@ -3376,9 +3380,14 @@ final class HLSRemuxer: @unchecked Sendable {
         hevcConfiguration: HEVCConfigurationRecord? = nil
     ) -> MasterPlaylistBuilder.VariantDescription? {
         guard let codec = videoCodecDeclaration(for: video, hevcConfiguration: hevcConfiguration) else { return nil }
+        // Dual-PID M2TS BLs legitimately have no DOVI side data, so probing
+        // their range alone can say SDR. A verified P7→8.1 declaration is an
+        // HDR10/PQ base by construction and must drive VIDEO-RANGE honestly.
+        let outputRange: DynamicRange = dolbyVision?.profile == 8
+            && dolbyVision?.baseLayerSignalCompatibilityID == 1 ? .pq : video.dynamicRange
 
         guard Self.masterVariantPermitted(
-            dynamicRange: video.dynamicRange,
+            dynamicRange: outputRange,
             dolbyVision: dolbyVision,
             displayIsHDRReady: displayIsHDRReady,
             displayIsDolbyVisionCapable: displayIsDolbyVisionCapable
@@ -3391,7 +3400,7 @@ final class HLSRemuxer: @unchecked Sendable {
                 ? .init(width: video.width, height: video.height)
                 : nil,
             frameRate: video.frameRate,
-            dynamicRange: video.dynamicRange,
+            dynamicRange: outputRange,
             videoCodec: codec,
             dolbyVision: dolbyVision,
             displayIsDolbyVisionCapable: displayIsDolbyVisionCapable

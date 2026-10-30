@@ -128,6 +128,7 @@ struct M2TSDolbyVisionPMTTests {
         #expect(masterText.contains("CODECS=\"hvc1."))
         #expect(masterText.contains("SUPPLEMENTAL-CODECS=\"dvh1.08"))
         #expect(masterText.contains("db1p"))
+        #expect(masterText.contains("VIDEO-RANGE=PQ"))
         let stats: DolbyVisionConversionStats
         do {
             stats = try await materializeToEnd(session: session, master: playlist)
@@ -141,6 +142,55 @@ struct M2TSDolbyVisionPMTTests {
         #expect(stats.convertedRPUs >= 192)
         #expect(stats.droppedEnhancementLayerNALs >= 192)
         #expect(stats.isClean)
+    }
+
+    @Test("M2TS reuses harvested BL keys for an exact forced re-anchor")
+    func harvestedKeyframeMapSupportsReanchor() async throws {
+        let source = try #require(
+            (ProcessInfo.processInfo.environment["PRISMCORE_DV7_M2TS_FIXTURES"] ?? "")
+                .split(separator: ":").first.map { URL(fileURLWithPath: String($0)) }
+        )
+        let cache = FileManager.default.temporaryDirectory
+            .appendingPathComponent("prismcore-m2ts-keys-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: cache) }
+
+        let first = try PrismCoreSession(
+            url: source,
+            display: .init(isHDRReady: true, isDolbyVisionCapable: true),
+            keyframeIndexCacheDirectory: cache,
+            segmentTargetDuration: 1,
+            requireDolbyVisionTransportPairing: true
+        )
+        let firstMaster = try await first.start()
+        _ = try await materializeToEnd(session: first, master: firstMaster)
+        await first.stop()
+        let cachedMaps = try FileManager.default.contentsOfDirectory(atPath: cache.path)
+        #expect(!cachedMaps.isEmpty, "first sequential M2TS run did not persist harvested BL keys")
+
+        let replay = try PrismCoreSession(
+            url: source,
+            display: .init(isHDRReady: true, isDolbyVisionCapable: true),
+            segmentCacheBytes: 1,
+            keyframeIndexCacheDirectory: cache,
+            segmentTargetDuration: 1,
+            requireDolbyVisionTransportPairing: true
+        )
+        defer { Task { await replay.stop() } }
+        let master = try await replay.start()
+        #expect((replay.segmentTimeline?.segments.count ?? 0) >= 8)
+        let masterText = try await fetchText(master)
+        guard let relative = PrismCoreSession.playlistURIs(inMaster: masterText).last,
+              let media = URL(string: relative, relativeTo: master)?.absoluteURL
+        else { throw M2TSFixtureError.unproven("no replay video media playlist") }
+        let root = master.deletingLastPathComponent()
+        let initBefore = try await fetchData(root.appendingPathComponent("init.mp4"))
+        _ = try await fetchData(media.deletingLastPathComponent().appendingPathComponent("seg00000.m4s"))
+        // A tiny cache evicts the head. A tail request must re-anchor from the
+        // harvested packet-key map, not revive the rejected PCR index.
+        _ = try await fetchData(media.deletingLastPathComponent().appendingPathComponent("seg00007.m4s"))
+        #expect(try await fetchData(root.appendingPathComponent("init.mp4")) == initBefore)
+        #expect((await replay.dolbyVisionConversion)?.isClean == true)
     }
 }
 

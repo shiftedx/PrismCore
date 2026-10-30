@@ -216,6 +216,16 @@ struct M2TSDolbyVisionAssociation: Sendable, Equatable {
         if interruptGuard.shouldInterrupt {
             return .ioFailure(code: swift_AVERROR_EXIT(), operation: "M2TS Dolby Vision scan budget exhausted")
         }
+        // Custom AVIO records the host's typed failure even when libavformat
+        // turns its callback's errno into an EOF-shaped read result. Do not
+        // let that partial prefix fall through to the raw parser as a missing
+        // or malformed association; HLSRemuxer restores this cause first.
+        if interruptGuard.customInputFailure != nil {
+            return .ioFailure(
+                code: pb.pointee.error < 0 ? pb.pointee.error : swift_AVERROR(EIO),
+                operation: "avio_read(M2TS Dolby Vision)"
+            )
+        }
         if pb.pointee.error < 0 {
             return .ioFailure(code: pb.pointee.error, operation: "avio_read(M2TS Dolby Vision)")
         }
