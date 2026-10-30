@@ -101,6 +101,14 @@ public struct SuppliedKeyframeMap: Sendable, Equatable {
     public var completeness: IndexCompleteness
     /// The last timestamp of the contiguous run, for a `partial` map.
     public var coveredThroughPTS: Int64?
+    /// MPEG-TS PID carrying the base-layer access units. Required when a
+    /// strict dual-PID M2TS session consumes this externally observed map.
+    public var transportPID: Int32?
+    /// Exact byte length of the representation the map was built from.
+    public var sourceSize: Int64?
+    /// Byte offsets aligned with `keyframePTS`. Strict M2TS uses these to
+    /// seek directly to the earliest packet needed for the matching BL/EL AU.
+    public var packetOffsets: [Int64]?
 
     public init(
         streamIndex: Int32,
@@ -108,7 +116,10 @@ public struct SuppliedKeyframeMap: Sendable, Equatable {
         timeBaseDen: Int32,
         keyframePTS: [Int64],
         completeness: IndexCompleteness,
-        coveredThroughPTS: Int64? = nil
+        coveredThroughPTS: Int64? = nil,
+        transportPID: Int32? = nil,
+        sourceSize: Int64? = nil,
+        packetOffsets: [Int64]? = nil
     ) {
         self.streamIndex = streamIndex
         self.timeBaseNum = timeBaseNum
@@ -116,6 +127,9 @@ public struct SuppliedKeyframeMap: Sendable, Equatable {
         self.keyframePTS = keyframePTS
         self.completeness = completeness
         self.coveredThroughPTS = coveredThroughPTS
+        self.transportPID = transportPID
+        self.sourceSize = sourceSize
+        self.packetOffsets = packetOffsets
     }
 
     /// The largest map this engine will consider. The same ceiling the export
@@ -231,6 +245,22 @@ extension SuppliedKeyframeMap {
             // member exists to contain.
             return .malformedMap("completeness is \(completeness.rawValue)")
         }
+        if let transportPID, !(0...0x1FFF).contains(transportPID) {
+            return .malformedMap("transport PID is outside the MPEG-TS range")
+        }
+        switch (sourceSize, packetOffsets) {
+        case (nil, nil):
+            break
+        case let (size?, offsets?):
+            guard size > 0, offsets.count == keyframePTS.count else {
+                return .malformedMap("packet offsets do not match the keyframe map")
+            }
+            guard offsets.allSatisfy({ $0 >= 0 && $0 < size && $0 % 192 == 0 }) else {
+                return .outOfBounds("packet offset is outside the M2TS representation")
+            }
+        default:
+            return .malformedMap("packet offsets require the source size")
+        }
         return nil
     }
 }
@@ -254,14 +284,10 @@ public struct HintOutcome: Sendable, Equatable {
     /// The supplied map, if it survived every check that can be made before
     /// the first read.
     ///
-    /// **Carried, not yet consumed.** §3.1's rule 5 makes a supplied map
-    /// unusable until the transport binding of the design's P2 exists at both
-    /// ends of the wire, so wiring it into `SegmentPlan.build` today would
-    /// create a path that may not legally execute — and the only way it
-    /// *could* execute is the bug the design warns about, a remote assertion
-    /// being harvested into the local sidecar as though it were a local read.
-    /// It is validated and exposed here; the seam that will consume it is
-    /// `SegmentPlan.build(cachedKeyframes:)`, and nothing reaches it yet.
+    /// Strict dual-PID M2TS may consume a complete map only after it has
+    /// independently proven the PMT base PID and exact source length. Other
+    /// sessions keep this as an observation. No supplied map is ever written
+    /// into the local harvested-keyframe sidecar.
     public let acceptedKeyframes: SuppliedKeyframeMap?
 
     static let unhinted = HintOutcome(

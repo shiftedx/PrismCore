@@ -239,6 +239,41 @@ struct SourceOpenHintsTests {
         ) != nil)
     }
 
+    @Test("M2TS packet offsets are complete, aligned, and representation-bounded")
+    func packetOffsetEvidenceIsValidated() {
+        let valid = SuppliedKeyframeMap(
+            streamIndex: 0, timeBaseNum: 1, timeBaseDen: 1000,
+            keyframePTS: [0, 2000, 4000], completeness: .complete,
+            transportPID: 0x1011, sourceSize: 192 * 10,
+            packetOffsets: [0, 192 * 3, 192 * 8]
+        )
+        #expect(valid.validate(against: facts()) == nil)
+        #expect(SuppliedKeyframeMap(
+            streamIndex: 0, timeBaseNum: 1, timeBaseDen: 1000,
+            keyframePTS: [0, 2000, 4000], completeness: .complete,
+            transportPID: 0x2000, sourceSize: 192 * 10,
+            packetOffsets: [0, 192 * 3, 192 * 8]
+        ).validate(against: facts()) != nil)
+        #expect(SuppliedKeyframeMap(
+            streamIndex: 0, timeBaseNum: 1, timeBaseDen: 1000,
+            keyframePTS: [0, 2000, 4000], completeness: .complete,
+            transportPID: 0x1011, sourceSize: 192 * 10,
+            packetOffsets: [0, 193, 192 * 8]
+        ).validate(against: facts()) != nil)
+        #expect(SuppliedKeyframeMap(
+            streamIndex: 0, timeBaseNum: 1, timeBaseDen: 1000,
+            keyframePTS: [0, 2000, 4000], completeness: .complete,
+            transportPID: 0x1011, sourceSize: 192 * 10,
+            packetOffsets: [0, 192 * 3]
+        ).validate(against: facts()) != nil)
+        #expect(SuppliedKeyframeMap(
+            streamIndex: 0, timeBaseNum: 1, timeBaseDen: 1000,
+            keyframePTS: [0, 2000, 4000], completeness: .complete,
+            transportPID: 0x1011, sourceSize: 192 * 10,
+            packetOffsets: [0, 192 * 3, 192 * 10]
+        ).validate(against: facts()) != nil)
+    }
+
     @Test("Timestamps outside the stream's own span reject the whole map")
     func outOfBounds() {
         #expect(map(keyframePTS: [-500, 2000]).validate(against: facts()) != nil)

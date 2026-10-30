@@ -96,8 +96,19 @@ enum HintEvaluation {
             }
         }
         let best = av_find_best_stream(input, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
-        guard best >= 0, best < Int32(input.pointee.nb_streams),
-              let stream = input.pointee.streams[Int(best)] else {
+        let selected: Int32 = if let pid = map.transportPID,
+                                 let index = videoIndexes.first(where: {
+                                     input.pointee.streams[Int($0)]?.pointee.id == pid
+                                 }) {
+            // A dual-PID transport can mark the enhancement stream as FFmpeg's
+            // default video. Its map names the PMT-selected BL PID instead;
+            // strict M2TS independently verifies that role before consumption.
+            index
+        } else {
+            best
+        }
+        guard selected >= 0, selected < Int32(input.pointee.nb_streams),
+              let stream = input.pointee.streams[Int(selected)] else {
             return .init(
                 videoStreamIndexes: videoIndexes, streamIndex: -1,
                 timeBaseNum: 0, timeBaseDen: 0, startPTS: nil, durationPTS: nil
@@ -114,7 +125,7 @@ enum HintEvaluation {
         }()
         return .init(
             videoStreamIndexes: videoIndexes,
-            streamIndex: best,
+            streamIndex: selected,
             timeBaseNum: timeBase.num,
             timeBaseDen: timeBase.den,
             startPTS: startPTS,
