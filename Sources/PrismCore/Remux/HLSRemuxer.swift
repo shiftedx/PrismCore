@@ -993,23 +993,12 @@ final class HLSRemuxer: @unchecked Sendable {
             case let .ioFailure(code, operation):
                 throw sourceFailure(code: code, operation: operation)
             }
-            // The scanner sought the source head and restored the byte cursor,
-            // but libavformat's packet state is not seek-transparent.  Start
-            // its demuxer at the same head the ordinary probe handover uses.
-            interruptGuard.arm(budget: M2TSDolbyVisionAssociation.scanBudget)
-            let rewound = av_seek_frame(input, -1, 0, AVSEEK_FLAG_BACKWARD)
-            let rewindInterrupted = interruptGuard.shouldInterrupt
-            interruptGuard.disarm()
-            if rewound < 0 {
-                throw sourceFailure(code: rewound, operation: "av_seek_frame(M2TS Dolby Vision head)")
-            }
-            if rewindInterrupted {
-                throw sourceFailure(
-                    code: swift_AVERROR_EXIT(), operation: "av_seek_frame(M2TS Dolby Vision head budget exhausted)"
-                )
-            }
-            avformat_flush(input)
+            // The scanner restores AVIO's cursor but not libavformat's packet
+            // state. Delay that reset until SourceProbe identifies the PMT
+            // selected BL stream: FFmpeg's default stream can be the EL and
+            // skip the opening base-layer IRAP.
             needsRewindToHead = true
+            avformat_flush(input)
         } else {
             m2tsAssociation = nil
         }
@@ -1069,7 +1058,8 @@ final class HLSRemuxer: @unchecked Sendable {
             // verification's dozen frames are not rewound here: that is the
             // window captions have always been scouted from.
             if adoptedInfo?.hdr10Plus?.consumedPackets == true {
-                _ = av_seek_frame(input, -1, 0, AVSEEK_FLAG_BACKWARD)
+                let headStream = requireDolbyVisionTransportPairing ? videoIndex : -1
+                _ = av_seek_frame(input, headStream, 0, AVSEEK_FLAG_BACKWARD)
                 avformat_flush(input)
             }
             closedCaptions = ClosedCaptionScout.scan(
@@ -1154,6 +1144,26 @@ final class HLSRemuxer: @unchecked Sendable {
         // correctly left before the anchor; keep that presentation floor for
         // both tracks rather than accepting an unmatched BL after the anchor.
         var separatePairingMinimumPTS: Int64?
+        // A timestamp seek in MPEG-TS only gets the demuxer near the requested
+        // point. For the strict DV route, no bytes are published after that
+        // seek until a separately verified BL IRAP and its exact-PTS EL/RPU
+        // arrive. The interrupt guard stays armed over those reads: a generic
+        // timestamp seek may otherwise linearly walk a hostile origin.
+        var m2tsLocalSeekTargetPTS: Int64?
+        var m2tsLocalSeekMaximumPTS: Int64?
+        var m2tsLocalSeekInitialBytes: Int64?
+        // A timestamp seek only places the demuxer near an access unit. Once
+        // we have buffered a BL IRAP at or after the requested floor, retain
+        // later BL AUs while waiting for its EL: B-frame decode order can put
+        // those BL packets before the matching EL arrives.
+        var m2tsCandidateIRAPPTS: Int64?
+        func clearM2TSLocalSeek() {
+            m2tsLocalSeekTargetPTS = nil
+            m2tsLocalSeekMaximumPTS = nil
+            m2tsLocalSeekInitialBytes = nil
+            m2tsCandidateIRAPPTS = nil
+            interruptGuard.disarm()
+        }
         func discardReadySeparatePackets() {
             for ready in readySeparatePackets {
                 var packet: UnsafeMutablePointer<AVPacket>? = ready.packet
@@ -1161,7 +1171,21 @@ final class HLSRemuxer: @unchecked Sendable {
             }
             readySeparatePackets.removeAll(keepingCapacity: true)
         }
+        func discardReadySeparatePackets(before normalizedPTS: Int64) {
+            var retained: [SeparateTrackDolbyVisionPairer.Ready] = []
+            retained.reserveCapacity(readySeparatePackets.count)
+            for ready in readySeparatePackets {
+                if ready.normalizedPTS >= normalizedPTS {
+                    retained.append(ready)
+                    continue
+                }
+                var packet: UnsafeMutablePointer<AVPacket>? = ready.packet
+                av_packet_free(&packet)
+            }
+            readySeparatePackets = retained
+        }
         defer { discardReadySeparatePackets() }
+        defer { clearM2TSLocalSeek() }
         // What the manifest may claim: the *converted* configuration when we are
         // converting, the source's own otherwise. Declaring 8.1 for a stream
         // whose RPUs are still P7 would be the one lie AVKit can't detect at
@@ -1234,7 +1258,10 @@ final class HLSRemuxer: @unchecked Sendable {
         // in a separate namespace so an ordinary MPEG-TS play can never lend
         // it an untrusted demuxer index.
         let cacheIdentity = baseCacheIdentity.map {
-            requireDolbyVisionTransportPairing ? "\($0)|m2ts-dv-packet-keys-v1" : $0
+            // v2 requires the PMT-selected BL stream on every head rewind.
+            // v1 could harvest after FFmpeg's default (often EL) stream
+            // skipped the opening BL GOP, so it is not equivalent evidence.
+            requireDolbyVisionTransportPairing ? "\($0)|m2ts-dv-packet-keys-v2" : $0
         }
         // A previous play's harvested keyframe map, when its time base still
         // matches the stream's. It replaces the demuxer index in the plan —
@@ -1261,20 +1288,95 @@ final class HLSRemuxer: @unchecked Sendable {
         // exactly and the tail on the uniform stride — see `keyframePlan`.
         let cachedCoveredThrough: Int64? = cachedEntry.flatMap { $0.complete ? nil : $0.coveredThroughPTS }
 
-        let (builtPlan, planRewoundToHead): (SegmentPlan?, Bool) = demandEligible
-            ? SegmentPlan.buildReportingPosition(
-                input: input, videoStreamIndex: videoIndex, targetSeconds: segmentSeconds,
-                firstSegmentSeconds: firstSegmentSeconds,
-                indexLoadBudget: indexLoadBudget,
-                interruptGuard: interruptGuard, cachedKeyframes: cachedKeyframes,
-                cachedCoveredThroughPTS: cachedCoveredThrough
+        // MPEG-TS's generic timestamp index is made from PCR/seek anchors. It
+        // can point between HEVC pictures, so a strict transport-DV session
+        // must never turn it into a segment promise. On a cold play, observe a
+        // short contiguous head prefix of *actual* base-layer IRAPs instead.
+        // This is deliberately only current-session evidence: normal packet
+        // harvesting remains the sole route that persists a map.
+        var planningKeyframes = cachedKeyframes
+        var planningCoveredThrough = cachedCoveredThrough
+        var scoutRewoundToHead = false
+        if requireDolbyVisionTransportPairing, demandEligible, planningKeyframes == nil {
+            let stream = input.pointee.streams[Int(videoIndex)]!
+            let scout = M2TSColdKeyframeScout.scan(
+                input: input, baseStreamIndex: videoIndex, timeBase: stream.pointee.time_base,
+                interruptGuard: interruptGuard
             )
+            switch scout {
+            case let .success(keyframes, coveredThrough):
+                planningKeyframes = keyframes
+                planningCoveredThrough = coveredThrough
+                scoutRewoundToHead = true
+            case .insufficient(rewindRequired: false):
+                // No head-prefix witness is safe to publish. Retain the
+                // existing sequential behavior rather than falling back to
+                // the transport's PCR index.
+                break
+            case .cancelled(rewindRequired: false) where cancelled.isSet:
+                return
+            case .cancelled(rewindRequired: false):
+                throw sourceFailure(
+                    code: swift_AVERROR_EXIT(), operation: "M2TS cold keyframe scout cancelled"
+                )
+            case let .ioFailure(code, operation, _):
+                throw sourceFailure(code: code, operation: operation)
+            case .insufficient, .cancelled:
+                // The scout moved this AVFormatContext but could not put it
+                // back at the head. Continuing from an unknown cursor could
+                // silently omit the opening configuration/AUs.
+                throw sourceFailure(
+                    code: swift_AVERROR_EXIT(), operation: "M2TS cold keyframe scout head restore"
+                )
+            }
+        }
+
+        // Do not even ask FFmpeg to load its transport index in strict M2TS
+        // mode: a scout/cache miss is intentionally sequential, while a
+        // witnessed packet map is passed as a partial keyframe map.
+        let m2tsTimelineEndPTS: Int64? = {
+            guard requireDolbyVisionTransportPairing else { return nil }
+            let stream = input.pointee.streams[Int(videoIndex)]!.pointee
+            if stream.start_time != swift_AV_NOPTS_VALUE(), stream.duration > 0 {
+                return stream.start_time + stream.duration
+            }
+            guard input.pointee.start_time != swift_AV_NOPTS_VALUE(), input.pointee.duration > 0 else {
+                return nil
+            }
+            return av_rescale_q(
+                input.pointee.start_time + input.pointee.duration,
+                AVRational(num: 1, den: AV_TIME_BASE), stream.time_base
+            )
+        }()
+        let (builtPlan, planRewoundToHead): (SegmentPlan?, Bool) = demandEligible
+            ? (requireDolbyVisionTransportPairing && planningKeyframes == nil
+                ? (nil, false)
+                : SegmentPlan.buildReportingPosition(
+                    input: input, videoStreamIndex: videoIndex, targetSeconds: segmentSeconds,
+                    firstSegmentSeconds: firstSegmentSeconds,
+                    indexLoadBudget: indexLoadBudget,
+                    interruptGuard: interruptGuard, cachedKeyframes: planningKeyframes,
+                    cachedCoveredThroughPTS: planningCoveredThrough,
+                    timelineEndPTS: m2tsTimelineEndPTS
+                ))
             : (nil, false)
-        if needsRewindToHead, !planRewoundToHead {
+        if needsRewindToHead, !planRewoundToHead, !scoutRewoundToHead {
             // The plan did not pass through the head (cached map, an index
             // loaded at open, or no plan at all): rewind the adopted context
             // ourselves. `avformat_flush` drops the probe's queued packets.
-            _ = av_seek_frame(input, -1, 0, AVSEEK_FLAG_BACKWARD)
+            let headStream = requireDolbyVisionTransportPairing ? videoIndex : -1
+            if requireDolbyVisionTransportPairing {
+                interruptGuard.arm(budget: M2TSDolbyVisionAssociation.scanBudget)
+            }
+            let rewound = av_seek_frame(input, headStream, 0, AVSEEK_FLAG_BACKWARD)
+            let rewindInterrupted = requireDolbyVisionTransportPairing && interruptGuard.shouldInterrupt
+            if requireDolbyVisionTransportPairing { interruptGuard.disarm() }
+            if rewound < 0 || rewindInterrupted {
+                throw sourceFailure(
+                    code: rewound < 0 ? rewound : swift_AVERROR_EXIT(),
+                    operation: "av_seek_frame(M2TS Dolby Vision base head)"
+                )
+            }
             avformat_flush(input)
         }
         // MPEG-TS index entries are seek/PCR anchors, not proof that the
@@ -1283,10 +1385,10 @@ final class HLSRemuxer: @unchecked Sendable {
         // harvests real packet keyframes; publishing a demand plan from this
         // index created a phantom tail segment that no source keyframe could
         // open. Matroska and ordinary M2TS retain their existing plan policy.
-        let plannedPlan: SegmentPlan? = (!requireDolbyVisionTransportPairing || cachedKeyframes != nil)
+        let plannedPlan: SegmentPlan? = (!requireDolbyVisionTransportPairing || planningKeyframes != nil)
             && builtPlan?.basis == .keyframeIndex ? builtPlan : nil
         builtPlanLock.withLock { builtPlanStorage = builtPlan }
-        let planIsPartial = plannedPlan != nil && cachedCoveredThrough != nil
+        let planIsPartial = plannedPlan != nil && planningCoveredThrough != nil
         if let onStartupPhase {
             // The cached map and a freshly loaded index reach the same plan by
             // very different routes (one skips the index-load seek entirely),
@@ -1415,6 +1517,10 @@ final class HLSRemuxer: @unchecked Sendable {
         // reject the whole map if they were stored.
         let shouldHarvestKeyframes = keyframeCache != nil && cacheIdentity != nil
             && demandEligible && builtPlan != nil && (plannedPlan == nil || planIsPartial)
+        // A scout map is an in-memory startup hint only. Persisted maps must
+        // consist solely of packet keys the producer itself traversed from
+        // the head; otherwise a cancelled first play could bless unproduced
+        // scout evidence for the next source open.
         var harvestedKeyframes: [Int64]? = shouldHarvestKeyframes ? (cachedKeyframes ?? []) : nil
         var harvestCoveredThrough: Int64? = cachedCoveredThrough
         var harvestRunExtendsCoverage = true
@@ -2044,16 +2150,50 @@ final class HLSRemuxer: @unchecked Sendable {
             separateDolbyVisionPairer?.reset()
             discardReadySeparatePackets()
             separatePairingMinimumPTS = target
+            clearM2TSLocalSeek()
             // A seek is a read: over HTTP it is a Range request to the same
             // origin the copy loop reads from, so its failure is a source
             // failure and goes to recovery like one (`reanchorRecovering`).
-            // The strict M2TS map names real packet keyframes, but FFmpeg's
-            // transport seek still follows PCR/index anchors that need not be
-            // pictures. Start at the head and discard to the verified target.
-            let seekTarget = requireDolbyVisionTransportPairing ? 0 : target
+            // MPEG-TS's timestamp seek is merely a locality hint: the packet
+            // loop below still insists on a real BL IRAP plus the EL/RPU at
+            // exactly the same presentation time before writing anything.
+            // Starting from the head here defeated cold deep seeks entirely.
+            let localByteBaseline: Int64?
+            if requireDolbyVisionTransportPairing {
+                guard let pb = input.pointee.pb, pb.pointee.bytes_read >= 0 else {
+                    throw SourceReadFailure(underlying: sourceFailure(
+                        code: swift_AVERROR(EIO), operation: "M2TS local seek byte counter"
+                    ))
+                }
+                localByteBaseline = pb.pointee.bytes_read
+                interruptGuard.arm(budget: M2TSColdKeyframeScout.timeBudget)
+            } else {
+                localByteBaseline = nil
+            }
+            // Start one planned boundary earlier when possible. MPEG-TS's
+            // generic timestamp seek may otherwise choose the next PCR
+            // anchor *after* the requested IRAP, leaving no later IRAP in a
+            // short tail to prove. The output floor stays `target`; this is
+            // bounded local preroll, never a head walk.
+            let seekTarget = requireDolbyVisionTransportPairing && anchor > 0
+                ? plannedPlan.entries[anchor - 1].startPTS
+                : target
             let sought = av_seek_frame(input, videoIndex, seekTarget, AVSEEK_FLAG_BACKWARD)
-            if sought < 0 {
-                throw SourceReadFailure(underlying: sourceFailure(code: sought, operation: "av_seek_frame"))
+            let interrupted = requireDolbyVisionTransportPairing && interruptGuard.shouldInterrupt
+            if sought < 0 || interrupted {
+                clearM2TSLocalSeek()
+                throw SourceReadFailure(underlying: sourceFailure(
+                    code: sought < 0 ? sought : swift_AVERROR_EXIT(), operation: "av_seek_frame"
+                ))
+            }
+            avformat_flush(input)
+            if let localByteBaseline {
+                let localLimit = Int64(
+                    (Double(target) + SegmentPlan.maxTrustedGapSeconds / tickSeconds).rounded(.up)
+                )
+                m2tsLocalSeekTargetPTS = target
+                m2tsLocalSeekMaximumPTS = localLimit
+                m2tsLocalSeekInitialBytes = localByteBaseline
             }
             // A re-anchor rebuilds every muxer, which is the one moment a new
             // audio offset can be taken up: the shift moves audio dts, and
@@ -2276,6 +2416,34 @@ final class HLSRemuxer: @unchecked Sendable {
                     ? readySeparatePackets.removeFirst()
                     : nil
                 if let pairedPacket {
+                    if let target = m2tsLocalSeekTargetPTS {
+                        let pairedPTS = pairedPacket.sourcePTS
+                        let maximum = m2tsLocalSeekMaximumPTS ?? target
+                        guard pairedPTS <= maximum else {
+                            var rejected: UnsafeMutablePointer<AVPacket>? = pairedPacket.packet
+                            av_packet_free(&rejected)
+                            throw Failure.invalidDolbyVisionConversion
+                        }
+                        guard let candidatePTS = m2tsCandidateIRAPPTS,
+                              pairedPTS == candidatePTS,
+                              pairedPTS >= target,
+                              pairedPacket.isIRAP
+                        else {
+                            var discarded: UnsafeMutablePointer<AVPacket>? = pairedPacket.packet
+                            av_packet_free(&discarded)
+                            throw Failure.invalidDolbyVisionConversion
+                        }
+                        // `Ready` exists only after the pairer has validated
+                        // exactly one EL RPU at this BL presentation time.
+                        // Advance the floor to the observed IRAP, not the
+                        // inferred tail boundary: B/RASL AUs in between must
+                        // not leak into the new independent fragment.
+                        separatePairingMinimumPTS = pairedPTS
+                        separateDolbyVisionPairer?.discardBefore(normalizedPTS: pairedPacket.normalizedPTS)
+                        discardReadySeparatePackets(before: pairedPacket.normalizedPTS)
+                        droppingUntilPTS = nil
+                        clearM2TSLocalSeek()
+                    }
                     av_packet_unref(packet)
                     av_packet_move_ref(packet, pairedPacket.packet)
                     var packetToFree: UnsafeMutablePointer<AVPacket>? = pairedPacket.packet
@@ -2295,6 +2463,14 @@ final class HLSRemuxer: @unchecked Sendable {
                 let readResult = pairedPacket == nil
                     ? autoreleasepool { av_read_frame(input, packet) }
                     : 0
+                if pairedPacket == nil, let baseline = m2tsLocalSeekInitialBytes,
+                   let pb = input.pointee.pb,
+                   pb.pointee.bytes_read - baseline > M2TSColdKeyframeScout.byteBudget {
+                    clearM2TSLocalSeek()
+                    throw SourceReadFailure(underlying: sourceFailure(
+                        code: swift_AVERROR_EXIT(), operation: "M2TS local seek byte budget exhausted"
+                    ))
+                }
                 // A demuxer does not always report a failed read. Matroska
                 // resyncs to the next cluster and reads on, so the call
                 // succeeds with a hole behind it — measured on the 30 s
@@ -2309,6 +2485,9 @@ final class HLSRemuxer: @unchecked Sendable {
                     ? input.pointee.pb?.pointee.error ?? 0
                     : 0
                 if readResult == swift_AVERROR_EOF(), latchedReadError >= 0 {
+                    if m2tsLocalSeekTargetPTS != nil {
+                        throw Failure.invalidDolbyVisionConversion
+                    }
                     reachedEOF = true
                     break
                 }
@@ -2367,23 +2546,28 @@ final class HLSRemuxer: @unchecked Sendable {
                 // pre-anchor packets belong to a segment nobody asked for.
                 if let target = droppingUntilPTS {
                     let rawStreamIndex = Int(packet.pointee.stream_index)
-                    let isAnchorKeyframe = Int32(packet.pointee.stream_index) == videoIndex
+                    let isAnchorKeyframe = (!requireDolbyVisionTransportPairing
+                        || separateDolbyVisionPairer == nil)
+                        && Int32(packet.pointee.stream_index) == videoIndex
                         && packet.pointee.flags & AV_PKT_FLAG_KEY != 0
                         && packet.pointee.pts != swift_AV_NOPTS_VALUE()
                         && packet.pointee.pts >= target
                     if isAnchorKeyframe {
                         droppingUntilPTS = nil
                     } else if let pairer = separateDolbyVisionPairer,
-                              rawStreamIndex == pairer.enhancementStreamIndex,
+                              (rawStreamIndex == pairer.baseStreamIndex
+                                  || rawStreamIndex == pairer.enhancementStreamIndex),
                               packet.pointee.pts != swift_AV_NOPTS_VALUE(),
                               av_rescale_q(
                                   packet.pointee.pts,
                                   input.pointee.streams[rawStreamIndex]!.pointee.time_base,
                                   videoTimeBase
                               ) >= target {
-                        // Keep an EL that belongs to (or follows) the seek
-                        // anchor even when it arrives before its BL. Dropping
-                        // it here would make a valid pair look incomplete.
+                        // Keep both halves that belong to (or follow) the
+                        // seek target. The pairer proves the actual anchor;
+                        // dropping one half here would make a valid pair look
+                        // incomplete, while clearing the floor here would
+                        // accept a PCR anchor rather than a BL IRAP.
                     } else {
                         continue
                     }
@@ -2402,10 +2586,32 @@ final class HLSRemuxer: @unchecked Sendable {
 
                 if !carriedSeparateTrackRPU, let pairer = separateDolbyVisionPairer,
                    streamIndex == pairer.baseStreamIndex || streamIndex == pairer.enhancementStreamIndex {
-                    if let minimumPTS = separatePairingMinimumPTS,
+                    let localFloor = m2tsCandidateIRAPPTS ?? separatePairingMinimumPTS
+                    if let minimumPTS = localFloor,
                        packet.pointee.pts != swift_AV_NOPTS_VALUE(),
                        av_rescale_q(packet.pointee.pts, sourceTimeBase, videoTimeBase) < minimumPTS {
                         continue
+                    }
+                    // Before the strict M2TS locator has proved its anchor,
+                    // accepting a non-IRAP BL can leave an unmatched
+                    // decode-order AU at the pairer's FIFO head. Keep ELs:
+                    // they may physically arrive before the BL IRAP.
+                    if let target = m2tsLocalSeekTargetPTS,
+                       streamIndex == pairer.baseStreamIndex,
+                       m2tsCandidateIRAPPTS == nil {
+                        let sourcePTS = packet.pointee.pts
+                        guard sourcePTS != swift_AV_NOPTS_VALUE(), sourcePTS >= target else {
+                            continue
+                        }
+                        guard try pairer.isBaseIRAP(packet) else {
+                            continue
+                        }
+                        // Drop only packets that precede this real candidate;
+                        // an EL at the same PTS may already be buffered.
+                        let normalizedCandidate = av_rescale_q(sourcePTS, sourceTimeBase, videoTimeBase)
+                        pairer.discardBefore(normalizedPTS: normalizedCandidate)
+                        discardReadySeparatePackets(before: normalizedCandidate)
+                        m2tsCandidateIRAPPTS = sourcePTS
                     }
                     let ready = try pairer.consume(
                         packet: packet, streamIndex: streamIndex, timeBase: sourceTimeBase
@@ -3493,12 +3699,23 @@ private final class SeparateTrackDolbyVisionPairer {
     struct Ready {
         let packet: UnsafeMutablePointer<AVPacket>
         let convertedRPU: [UInt8]
+        /// Presentation time in the pairer's common time base. The caller
+        /// uses this to prove that a timestamp seek landed on a real base
+        /// IRAP/EL pair rather than a PCR anchor between pictures.
+        let normalizedPTS: Int64
+        /// The selected BL stream's original PTS. Segment plans use this
+        /// exact time base, so a microsecond-normalized PTS must not be
+        /// round-tripped for an anchor comparison.
+        let sourcePTS: Int64
+        let isIRAP: Bool
     }
 
     private struct PendingBase {
         let pts: Int64
+        let sourcePTS: Int64
         let packet: UnsafeMutablePointer<AVPacket>
         let byteCount: Int
+        let isIRAP: Bool
     }
 
     private struct PendingEnhancement {
@@ -3572,25 +3789,54 @@ private final class SeparateTrackDolbyVisionPairer {
         }
     }
 
+    /// Drops state that belongs before an independently verified re-anchor.
+    /// EL packets at the anchor itself are retained: transport muxers may
+    /// write them before their matching BL IRAP.
+    func discardBefore(normalizedPTS: Int64) {
+        for base in bases where base.pts < normalizedPTS {
+            var packet: UnsafeMutablePointer<AVPacket>? = base.packet
+            av_packet_free(&packet)
+            bufferedBytes -= base.byteCount
+        }
+        bases.removeAll { $0.pts < normalizedPTS }
+        for enhancement in enhancements where enhancement.pts < normalizedPTS {
+            bufferedBytes -= enhancement.byteCount
+        }
+        enhancements.removeAll { $0.pts < normalizedPTS }
+    }
+
+    /// Validates a BL AU without buffering it, for the timestamp-seek
+    /// locator. The normal consume path repeats this strict walk before it
+    /// clones the packet, preserving ordinary playback validation.
+    func isBaseIRAP(_ packet: UnsafeMutablePointer<AVPacket>) throws -> Bool {
+        try validateBase(packet)
+    }
+
     private func consumeBase(_ packet: UnsafeMutablePointer<AVPacket>, pts: Int64) throws {
         guard !bases.contains(where: { $0.pts == pts }) else { throw reject() }
-        try validateBase(packet)
+        let isIRAP = try validateBase(packet)
         guard let copied = av_packet_clone(packet) else {
             throw FFmpegError(code: -1, operation: "av_packet_clone(Dolby Vision base)")
         }
         let byteCount = Int(packet.pointee.size)
-        bases.append(.init(pts: pts, packet: copied, byteCount: byteCount))
+        bases.append(.init(
+            pts: pts, sourcePTS: packet.pointee.pts, packet: copied,
+            byteCount: byteCount, isIRAP: isIRAP
+        ))
         bufferedBytes += byteCount
         try enforceBounds()
     }
 
-    private func validateBase(_ packet: UnsafeMutablePointer<AVPacket>) throws {
+    private func validateBase(_ packet: UnsafeMutablePointer<AVPacket>) throws -> Bool {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { throw reject() }
         let bytes = UnsafeBufferPointer(start: data, count: Int(packet.pointee.size))
         guard let units = HEVCNALUnits.strictUnits(in: bytes, framing: baseFraming),
               units.contains(where: { $0.type <= 31 }),
               !units.contains(where: { $0.type == 62 || $0.type == 63 || $0.layerID != 0 })
         else { throw reject() }
+        // HEVC reserves 22 and 23. Only the six coded IRAP NAL unit types
+        // prove that a segment can begin independently.
+        return units.contains(where: { (16...21).contains(Int($0.type)) })
     }
 
     private func consumeEnhancement(
@@ -3614,7 +3860,13 @@ private final class SeparateTrackDolbyVisionPairer {
             let base = bases.removeFirst()
             let enhancement = enhancements.remove(at: enhancementIndex)
             bufferedBytes -= base.byteCount + enhancement.byteCount
-            ready.append(.init(packet: base.packet, convertedRPU: enhancement.convertedRPU))
+            ready.append(.init(
+                packet: base.packet,
+                convertedRPU: enhancement.convertedRPU,
+                normalizedPTS: base.pts,
+                sourcePTS: base.sourcePTS,
+                isIRAP: base.isIRAP
+            ))
         }
         return ready
     }

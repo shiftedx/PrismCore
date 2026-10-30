@@ -170,7 +170,8 @@ struct SegmentPlan: Equatable {
         indexLoadBudget: Duration = SegmentPlan.indexLoadBudget,
         interruptGuard: ReadInterruptGuard? = nil,
         cachedKeyframes: [Int64]? = nil,
-        cachedCoveredThroughPTS: Int64? = nil
+        cachedCoveredThroughPTS: Int64? = nil,
+        timelineEndPTS: Int64? = nil
     ) -> (plan: SegmentPlan?, rewoundToHead: Bool) {
         var rewound = false
         let stream = input.pointee.streams[Int(videoStreamIndex)]!
@@ -252,7 +253,8 @@ struct SegmentPlan: Equatable {
             targetSeconds: targetSeconds,
             firstSegmentSeconds: firstSegmentSeconds,
             coveredThroughPTS: coveredThroughPTS,
-            indexLoadInterrupted: indexLoadInterrupted
+            indexLoadInterrupted: indexLoadInterrupted,
+            timelineEndPTS: timelineEndPTS
         ) {
             return (SegmentPlan(
                 entries: planned,
@@ -388,7 +390,8 @@ struct SegmentPlan: Equatable {
         targetSeconds: Int,
         firstSegmentSeconds: Int? = nil,
         coveredThroughPTS: Int64? = nil,
-        indexLoadInterrupted: Bool = false
+        indexLoadInterrupted: Bool = false,
+        timelineEndPTS: Int64? = nil
     ) -> [Entry]? {
         let trusted = coveredThroughPTS.map { limit in keyframes.filter { $0 <= limit } } ?? keyframes
         guard trusted.count >= 2 else { return nil }
@@ -448,7 +451,11 @@ struct SegmentPlan: Equatable {
         // The tail: from the last boundary keyframe to the container's end —
         // one entry for a complete map; for a partial one the uniform stride
         // takes over where the trusted keyframes end.
-        let endPTS = Int64(durationSeconds / tickSeconds)
+        // Most containers begin video at zero, so their duration is also the
+        // timeline endpoint. MPEG-TS often reports a presentation *length*
+        // plus a nonzero stream start; a caller with stream-level evidence can
+        // supply the absolute endpoint instead of silently dropping its tail.
+        let endPTS = timelineEndPTS ?? Int64(durationSeconds / tickSeconds)
         if coveredThroughPTS != nil {
             // The tail stride is at least the largest keyframe gap the prefix
             // showed. Boundaries here are time targets the producer cuts at
