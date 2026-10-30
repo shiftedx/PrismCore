@@ -11,39 +11,41 @@ import Testing
 )
 struct M2TSColdKeyframeScoutTests {
 
-    @Test("a witnessed base-layer prefix starts at the real head IRAP and leaves the context there")
-    func witnessedHeadPrefixIsUsableAfterRewind() throws {
+    @Test("a complete sparse map starts at the real head IRAP and leaves the context there")
+    func completeMapIsUsableAfterRewind() throws {
         var opened = try openFixture()
         defer { avformat_close_input(&opened.context) }
         let stream = try #require(opened.context?.pointee.streams[1])
 
-        let result = M2TSColdKeyframeScout.scan(
+        let result = M2TSColdKeyframeScout.completeSparsePlan(
             input: try #require(opened.context), baseStreamIndex: 1,
-            timeBase: stream.pointee.time_base, interruptGuard: opened.guardBox
+            timeBase: stream.pointee.time_base,
+            timelineEndPTS: stream.pointee.start_time + stream.pointee.duration,
+            targetSeconds: 6, firstSegmentSeconds: SegmentPlan.defaultFirstSegmentSeconds,
+            interruptGuard: opened.guardBox
         )
-        guard case let .success(keyframes, coveredThrough) = result else {
-            Issue.record("Expected an observed cold keyframe prefix, got \(result)")
+        guard case let .complete(keyframes) = result else {
+            Issue.record("Expected a complete observed cold keyframe map, got \(result)")
             return
         }
         #expect(!result.rewindRequired)
         let first = try #require(keyframes.first)
         #expect(first == 7_500)
-        #expect(coveredThrough == keyframes.last)
-        #expect(
-            (Double(coveredThrough) - Double(first))
-                * av_q2d(stream.pointee.time_base) >= Double(SegmentPlan.witnessSeconds)
-        )
+        #expect(keyframes.count > 2)
         #expect(try firstBaseIRAP(in: try #require(opened.context), streamIndex: 1) == 7_500)
     }
 
-    @Test("a byte or clock-starved scout never publishes a partial map")
+    @Test("a byte or clock-starved sparse proof never publishes a map")
     func boundedScoutFallsBackWithoutMap() throws {
         var byteStarved = try openFixture()
         defer { avformat_close_input(&byteStarved.context) }
         let byteStream = try #require(byteStarved.context?.pointee.streams[1])
-        let byteResult = M2TSColdKeyframeScout.scan(
+        let byteResult = M2TSColdKeyframeScout.completeSparsePlan(
             input: try #require(byteStarved.context), baseStreamIndex: 1,
-            timeBase: byteStream.pointee.time_base, interruptGuard: byteStarved.guardBox,
+            timeBase: byteStream.pointee.time_base,
+            timelineEndPTS: byteStream.pointee.start_time + byteStream.pointee.duration,
+            targetSeconds: 6, firstSegmentSeconds: SegmentPlan.defaultFirstSegmentSeconds,
+            interruptGuard: byteStarved.guardBox,
             byteBudget: 1
         )
         assertNoMap(byteResult)
@@ -51,9 +53,12 @@ struct M2TSColdKeyframeScoutTests {
         var clockStarved = try openFixture()
         defer { avformat_close_input(&clockStarved.context) }
         let clockStream = try #require(clockStarved.context?.pointee.streams[1])
-        let clockResult = M2TSColdKeyframeScout.scan(
+        let clockResult = M2TSColdKeyframeScout.completeSparsePlan(
             input: try #require(clockStarved.context), baseStreamIndex: 1,
-            timeBase: clockStream.pointee.time_base, interruptGuard: clockStarved.guardBox,
+            timeBase: clockStream.pointee.time_base,
+            timelineEndPTS: clockStream.pointee.start_time + clockStream.pointee.duration,
+            targetSeconds: 6, firstSegmentSeconds: SegmentPlan.defaultFirstSegmentSeconds,
+            interruptGuard: clockStarved.guardBox,
             timeBudget: .zero
         )
         assertNoMap(clockResult)
@@ -79,8 +84,10 @@ struct M2TSColdKeyframeScoutTests {
         let stream = try #require(opened.pointee.streams[1])
         input.failSubsequentReads()
 
-        let result = M2TSColdKeyframeScout.scan(
+        let result = M2TSColdKeyframeScout.completeSparsePlan(
             input: opened, baseStreamIndex: 1, timeBase: stream.pointee.time_base,
+            timelineEndPTS: stream.pointee.start_time + stream.pointee.duration,
+            targetSeconds: 6, firstSegmentSeconds: SegmentPlan.defaultFirstSegmentSeconds,
             interruptGuard: guardBox
         )
         guard case let .ioFailure(code, _, _) = result else {
@@ -91,8 +98,8 @@ struct M2TSColdKeyframeScoutTests {
         #expect(guardBox.customInputFailure != nil)
     }
 
-    private func assertNoMap(_ result: M2TSColdKeyframeScout.Result) {
-        if case .success = result {
+    private func assertNoMap(_ result: M2TSColdKeyframeScout.CompleteResult) {
+        if case .complete = result {
             Issue.record("A budget-starved scout published a keyframe map")
         }
     }

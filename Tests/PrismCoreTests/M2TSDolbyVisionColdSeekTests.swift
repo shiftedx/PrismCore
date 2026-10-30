@@ -67,43 +67,13 @@ struct M2TSDolbyVisionColdSeekTests {
             #expect(!data.isEmpty)
         }
 
-        // The scout itself is deliberately not cache evidence. Stopping this
-        // session only creates a sidecar after its producer has traversed
-        // real packet keys from the head; the next session must then use that
-        // packet-key namespace and still service a late re-anchor.
+        // These discontiguous cold requests never traverse one complete source run. A strict
+        // transport map may not turn that prefix into a future inferred tail; complete-harvest
+        // cache reuse remains covered by the M2TS cache contract.
         await session.stop()
         let sidecars = try FileManager.default.contentsOfDirectory(atPath: cache.path)
             .filter { $0.hasSuffix(".json") }
-        #expect(!sidecars.isEmpty, "producer did not persist a harvested packet-key map")
-
-        let warm = try PrismCoreSession(
-            url: URL(fileURLWithPath: path),
-            displayIsHDRReady: true,
-            displayIsDolbyVisionCapable: true,
-            segmentCacheBytes: 1,
-            keyframeIndexCacheDirectory: cache,
-            segmentTargetDuration: 6,
-            requireDolbyVisionTransportPairing: true
-        )
-        defer { Task { await warm.stop() } }
-        let warmMaster = try await warm.start()
-        let warmReport = await warm.diagnosticReport()
-        #expect(warmReport.startup.planOrigin == SegmentPlanOrigin.keyframeIndexCache.rawValue)
-        let warmMasterText = try await text(warmMaster)
-        guard let warmVariant = PrismCoreSession.playlistURIs(inMaster: warmMasterText).last,
-              let warmMedia = URL(string: warmVariant, relativeTo: warmMaster)?.absoluteURL
-        else { throw ColdSeekError.unproven("no warm video playlist") }
-        let warmMediaText = try await text(warmMedia)
-        let warmSegments = warmMediaText.split(whereSeparator: \.isNewline)
-            .filter { !$0.hasPrefix("#") && !$0.isEmpty }
-        guard warmSegments.indices.contains(index),
-              let warmSegment = URL(string: String(warmSegments[index]), relativeTo: warmMedia)?.absoluteURL
-        else { throw ColdSeekError.unproven("warm late segment missing") }
-        var warmRequest = URLRequest(url: warmSegment)
-        warmRequest.timeoutInterval = 10
-        let (warmData, warmResponse) = try await URLSession.uncached.data(for: warmRequest)
-        #expect((warmResponse as? HTTPURLResponse)?.statusCode == 200)
-        #expect(!warmData.isEmpty)
+        #expect(sidecars.isEmpty, "partial strict-M2TS evidence must not persist")
     }
 
     @Test(
