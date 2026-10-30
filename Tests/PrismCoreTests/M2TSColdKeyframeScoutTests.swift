@@ -78,6 +78,40 @@ struct M2TSColdKeyframeScoutTests {
             Issue.record("Expected cancellation to remain distinct from an insufficient proof, got \(cancelledResult)")
             return
         }
+
+        let source = try Data(contentsOf: URL(fileURLWithPath: try fixturePath()))
+        // Begin away from the head and delay each later read until the sparse proof expires.
+        // A healthy seekable input must still restore the proven BL head for sequential fallback.
+        let delayedInput = ScoutFaultingInput(data: source)
+        let delayedGuard = ReadInterruptGuard()
+        var delayedContext: UnsafeMutablePointer<AVFormatContext>? = delayedGuard.makeContext()
+        try delayedGuard.installCustomInput(on: try #require(delayedContext), factory: { delayedInput })
+        try FFmpegError.check(
+            avformat_open_input(&delayedContext, nil, nil, nil), "open delayed sparse-proof custom input"
+        )
+        defer { avformat_close_input(&delayedContext) }
+        let delayedOpened = try #require(delayedContext)
+        try FFmpegError.check(
+            avformat_find_stream_info(delayedOpened, nil), "read delayed sparse-proof custom input"
+        )
+        let delayedStream = try #require(delayedOpened.pointee.streams[1])
+        #expect(av_seek_frame(
+            delayedOpened, 1, delayedStream.pointee.start_time + delayedStream.pointee.duration / 2,
+            AVSEEK_FLAG_BACKWARD
+        ) >= 0)
+        avformat_flush(delayedOpened)
+        delayedInput.delayFutureReads(by: .milliseconds(1))
+        let expiredDuringProbe = M2TSColdKeyframeScout.completeSparsePlan(
+            input: delayedOpened, baseStreamIndex: 1, timeBase: delayedStream.pointee.time_base,
+            timelineEndPTS: delayedStream.pointee.start_time + delayedStream.pointee.duration,
+            targetSeconds: 6, firstSegmentSeconds: SegmentPlan.defaultFirstSegmentSeconds,
+            interruptGuard: delayedGuard, timeBudget: .milliseconds(10)
+        )
+        guard case .insufficient(rewindRequired: false) = expiredDuringProbe else {
+            Issue.record("A healthy deadline-expired sparse probe must restore the head, got \(expiredDuringProbe)")
+            return
+        }
+        #expect(try firstBaseIRAP(in: delayedOpened, streamIndex: 1) == 7_500)
     }
 
     @Test("a host input that dies after open remains an I/O failure")
@@ -171,6 +205,7 @@ private final class ScoutFaultingInput: PrismCoreInput, @unchecked Sendable {
     private let lock = NSLock()
     private var position = 0
     private var failReads = false
+    private var readDelay: Duration?
 
     init(data: Data) { bytes = [UInt8](data) }
 
@@ -180,8 +215,13 @@ private final class ScoutFaultingInput: PrismCoreInput, @unchecked Sendable {
         lock.withLock { failReads = true }
     }
 
+    func delayFutureReads(by duration: Duration) {
+        lock.withLock { readDelay = duration }
+    }
+
     func read(into buffer: UnsafeMutableRawBufferPointer) throws -> Int {
-        try lock.withLock {
+        if let delay = lock.withLock({ readDelay }) { Thread.sleep(forTimeInterval: delay.seconds) }
+        return try lock.withLock {
             if failReads { throw Broken() }
             let count = min(buffer.count, bytes.count - position)
             guard count > 0 else { return 0 }
