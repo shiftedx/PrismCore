@@ -101,6 +101,18 @@ final class DolbyVisionRPUConverter {
         self.lengthSize = lengthSize
     }
 
+    /// Separately carried EL access units are framed and validated by their
+    /// pairer.  This converter only receives the extracted RPU NAL, so no
+    /// source packet prefix width is involved.
+    convenience init?(separateTrack: Void = ()) {
+        guard Self.isAvailable else { return nil }
+        self.init(uncheckedSeparateTrackLengthSize: 4)
+    }
+
+    private init(uncheckedSeparateTrackLengthSize: Int) {
+        lengthSize = uncheckedSeparateTrackLengthSize
+    }
+
     /// Converted packet payload, or `nil` when this packet needed no change (the
     /// caller then writes the original buffer untouched).
     func convert(packet bytes: [UInt8]) -> [UInt8]? {

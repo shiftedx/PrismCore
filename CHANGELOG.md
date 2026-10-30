@@ -10,6 +10,16 @@ source-compatible.)
 
 ### Fixed
 
+- **Explicit dual-PID Profile 7 M2TS can now use the same metadata-only
+  fallback as an explicitly paired Matroska source.** PrismCore reads only a
+  bounded 192-byte M2TS PSI prefix from its existing input, requires one
+  current PAT/PMT program and a version-1 DOVI EL descriptor with a matching
+  HEVC base dependency, then verifies those exact PIDs against FFmpeg's two
+  video streams. Base and enhancement AUs are matched by PTS in bounded
+  storage; the real RPU becomes Profile 8.1 and real EL NALs are omitted.
+  This deliberately rejects unmarked, malformed, scrambled, discontinuous,
+  ambiguous, or mismatched transport layouts rather than inferring a nearby
+  HEVC PID. It does not reconstruct FEL pictures.
 - **Explicit dual-track Profile 7 Matroska files now have a native fallback.**
   A legacy disc layout can carry the HDR10 base layer on one HEVC track and
   its RPU/enhancement data on a second; treating a nearby HEVC stream as that

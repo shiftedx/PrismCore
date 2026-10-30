@@ -60,6 +60,10 @@ final class FMP4SegmentWriter {
     private var alignsToServedInit: Bool { restart && servedTimelineBase != nil }
     /// The first DTS and PTS each output stream handed movenc, shift included.
     private var firstMuxed: [Int: (dts: Int64, pts: Int64)] = [:]
+    /// MPEG-TS carries AAC as ADTS. MP4 needs the same frames without their
+    /// ADTS headers plus an AudioSpecificConfig in the sample entry; FFmpeg's
+    /// native filter supplies both before this writer emits its delayed moov.
+    private var aacADTSFilters: [Int: UnsafeMutablePointer<AVBSFContext>] = [:]
 
     /// input stream index → output stream index
     private(set) var streamMap: [Int: Int32] = [:]
@@ -68,6 +72,10 @@ final class FMP4SegmentWriter {
         // Normal teardown runs `finish()`; this is the error-path backstop.
         for index in Array(leadingDTS.keys) {
             for release in leadingDTS[index]?.drain() ?? [] { Self.free(release) }
+        }
+        for index in Array(aacADTSFilters.keys) {
+            var filter = aacADTSFilters.removeValue(forKey: index)
+            av_bsf_free(&filter)
         }
         if let output {
             avformat_free_context(output)
@@ -136,6 +144,11 @@ final class FMP4SegmentWriter {
                     "avcodec_parameters_copy"
                 )
                 outStream.pointee.codecpar.pointee.codec_tag = 0
+            }
+            if input.pointee.iformat.flatMap({ $0.pointee.name }).map({ String(cString: $0) })?
+                .split(separator: ",").contains("mpegts") == true,
+               inStream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_AAC {
+                try configureADTSFilter(input: inStream, output: outStream)
             }
             if outStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO {
                 // codecpar carries only the BITSTREAM aspect ratio; the
@@ -282,6 +295,33 @@ final class FMP4SegmentWriter {
     /// each caller: a path that skipped it would fail the whole remux on the
     /// first bad DTS.
     func write(_ packet: UnsafeMutablePointer<AVPacket>) throws {
+        let index = Int(packet.pointee.stream_index)
+        if let filter = aacADTSFilters[index] {
+            guard let copied = av_packet_clone(packet) else {
+                throw FFmpegError(code: -1, operation: "av_packet_clone(aac_adtstoasc)")
+            }
+            var owned: UnsafeMutablePointer<AVPacket>? = copied
+            defer { av_packet_free(&owned) }
+            try FFmpegError.check(av_bsf_send_packet(filter, copied), "av_bsf_send_packet(aac_adtstoasc)")
+            while true {
+                var filtered = av_packet_alloc()
+                guard let outputPacket = filtered else {
+                    throw FFmpegError(code: -1, operation: "av_packet_alloc(aac_adtstoasc)")
+                }
+                defer { av_packet_free(&filtered) }
+                let result = av_bsf_receive_packet(filter, outputPacket)
+                if result == swift_AVERROR(EAGAIN) || result == swift_AVERROR_EOF() {
+                    break
+                }
+                try FFmpegError.check(result, "av_bsf_receive_packet(aac_adtstoasc)")
+                try writePrepared(outputPacket)
+            }
+            return
+        }
+        try writePrepared(packet)
+    }
+
+    private func writePrepared(_ packet: UnsafeMutablePointer<AVPacket>) throws {
         // A stream that reorders pictures has no DTS for its first packets
         // after a seek: they wait here for the first real one, which numbers
         // them (`LeadingDTSBackfill`), and only then are repaired and muxed.
@@ -291,6 +331,38 @@ final class FMP4SegmentWriter {
             return
         }
         try repairAndMux(packet)
+    }
+
+    private func configureADTSFilter(
+        input: UnsafeMutablePointer<AVStream>, output: UnsafeMutablePointer<AVStream>
+    ) throws {
+        guard let named = av_bsf_get_by_name("aac_adtstoasc") else {
+            throw FFmpegError(code: -1, operation: "av_bsf_get_by_name(aac_adtstoasc)")
+        }
+        var filter: UnsafeMutablePointer<AVBSFContext>?
+        try FFmpegError.check(av_bsf_alloc(named, &filter), "av_bsf_alloc(aac_adtstoasc)")
+        guard let filter else { throw FFmpegError(code: -1, operation: "av_bsf_alloc(aac_adtstoasc)") }
+        do {
+            try FFmpegError.check(
+                avcodec_parameters_copy(filter.pointee.par_in, input.pointee.codecpar),
+                "avcodec_parameters_copy(aac_adtstoasc input)"
+            )
+            filter.pointee.time_base_in = input.pointee.time_base
+            try FFmpegError.check(av_bsf_init(filter), "av_bsf_init(aac_adtstoasc)")
+            try FFmpegError.check(
+                avcodec_parameters_copy(output.pointee.codecpar, filter.pointee.par_out),
+                "avcodec_parameters_copy(aac_adtstoasc output)"
+            )
+            output.pointee.codecpar.pointee.codec_tag = 0
+            output.pointee.time_base = filter.pointee.time_base_out
+            // HLSRemuxer rescales then rewrites copied packets to their MP4
+            // output stream index before it calls `write(_:)`.
+            aacADTSFilters[Int(output.pointee.index)] = filter
+        } catch {
+            var owned: UnsafeMutablePointer<AVBSFContext>? = filter
+            av_bsf_free(&owned)
+            throw error
+        }
     }
 
     /// Repair the packet's timestamps, apply the audio delay and the timeline

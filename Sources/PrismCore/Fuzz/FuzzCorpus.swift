@@ -25,6 +25,7 @@ package enum FuzzSeeds {
         "container-layout": [matroskaHead, faststartMP4Head],
         "hdr10plus-sei": [hdr10PlusAccessUnit(annexB: false), hdr10PlusAccessUnit(annexB: true)],
         "truehd-major-sync": [trueHDAtmosUnits],
+        "m2ts-dolby-vision-pmt": [Array(repeating: 0, count: 192)],
     ]
 
     /// A non-restart TrueHD access unit, then a restart unit whose major sync

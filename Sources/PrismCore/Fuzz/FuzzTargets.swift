@@ -43,9 +43,17 @@ package enum FuzzTargets {
         "container-layout": { @Sendable in containerLayout($0) },
         "hdr10plus-sei": { @Sendable in hdr10PlusSEI($0) },
         "truehd-major-sync": { @Sendable in trueHDMajorSync($0) },
+        "m2ts-dolby-vision-pmt": { @Sendable in m2tsDolbyVisionPMT($0) },
     ]
 
     // MARK: - Targets
+
+    /// The strict M2TS PSI scanner has no I/O in its byte-array entry point;
+    /// fuzzing it verifies arbitrary section lengths, pointers and transport
+    /// headers cannot turn into an association without its explicit proof.
+    package static func m2tsDolbyVisionPMT(_ bytes: [UInt8]) {
+        _ = M2TSDolbyVisionAssociation.scan(bytes)
+    }
 
     /// The HDR10+ scout's per-packet walk: NAL framing, the shared SEI message
     /// loop, and the ST 2094-40 T.35 header test, under every carriage.

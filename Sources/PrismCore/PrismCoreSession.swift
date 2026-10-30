@@ -343,6 +343,10 @@ public actor PrismCoreSession {
         /// Whether TrueHD Atmos is rendered with its heights (`.heights`) or
         /// bridged as its bed (`.off`, the default). See the initializer's doc.
         public var objectAudioRendering: ObjectAudioRendering = .off
+        /// Require an explicitly proven Dolby Vision dual-PID association when
+        /// opening an M2TS source selected by a host as Profile 7 transport
+        /// content. `false` preserves ordinary MPEG-TS/HEVC playback.
+        public var requireDolbyVisionTransportPairing: Bool = false
         /// The host's word that the output plays Dolby Atmos — Aether maps the
         /// system's Dolby Atmos setting here. `.heights` does nothing without it.
         public var allowsAtmosOutput: Bool = false
@@ -684,6 +688,7 @@ public actor PrismCoreSession {
         inBandClosedCaptions: Bool = false,
         bridgedAudio: BridgedAudioFormat = .compressed,
         objectAudioRendering: ObjectAudioRendering = .off,
+        requireDolbyVisionTransportPairing: Bool = false,
         allowsAtmosOutput: Bool = false
     ) throws {
         try self.init(
@@ -712,6 +717,7 @@ public actor PrismCoreSession {
             inBandClosedCaptions: inBandClosedCaptions,
             bridgedAudio: bridgedAudio,
             objectAudioRendering: objectAudioRendering,
+            requireDolbyVisionTransportPairing: requireDolbyVisionTransportPairing,
             allowsAtmosOutput: allowsAtmosOutput
         )
     }
@@ -866,6 +872,7 @@ public actor PrismCoreSession {
         inBandClosedCaptions: Bool = false,
         bridgedAudio: BridgedAudioFormat = .compressed,
         objectAudioRendering: ObjectAudioRendering = .off,
+        requireDolbyVisionTransportPairing: Bool = false,
         allowsAtmosOutput: Bool = false
     ) throws {
         self.configuration = Options(
@@ -890,6 +897,7 @@ public actor PrismCoreSession {
             inBandClosedCaptions: inBandClosedCaptions,
             bridgedAudio: bridgedAudio,
             objectAudioRendering: objectAudioRendering,
+            requireDolbyVisionTransportPairing: requireDolbyVisionTransportPairing,
             allowsAtmosOutput: allowsAtmosOutput
         )
         // A `ProbedSource` that was probed through a host input carries its
@@ -937,6 +945,7 @@ public actor PrismCoreSession {
             bridgedAudio: bridgedAudio,
             objectAudioRendering: objectAudioRendering,
             allowsAtmosOutput: allowsAtmosOutput,
+            requireDolbyVisionTransportPairing: requireDolbyVisionTransportPairing,
             probed: probed,
             input: inputFactory,
             keyframeCacheDirectory: keyframeIndexCacheDirectory,
@@ -1181,6 +1190,7 @@ public actor PrismCoreSession {
             inBandClosedCaptions: options.inBandClosedCaptions,
             bridgedAudio: options.bridgedAudio,
             objectAudioRendering: options.objectAudioRendering,
+            requireDolbyVisionTransportPairing: options.requireDolbyVisionTransportPairing,
             allowsAtmosOutput: options.allowsAtmosOutput
         )
         // A tripwire, not a doubt about today's initializer: the day someone

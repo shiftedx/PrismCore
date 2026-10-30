@@ -85,6 +85,41 @@ public struct HEVCConfigurationRecord: Sendable, Equatable {
             levelIDC: bytes[12]
         )
     }
+
+    /// Reads the general profile-tier-level from a real HEVC SPS carried in
+    /// MPEG-TS Annex-B extradata.  It intentionally does not manufacture an
+    /// `hvcC` record: transport sources still need FFmpeg to collect the VPS,
+    /// SPS and PPS for the produced fMP4 init segment.  This is solely the
+    /// trust check that prevents a PMT descriptor from declaring a different
+    /// `CODECS` value than the base or enhancement elementary stream carries.
+    static func parseM2TSInBandSPS(extradata data: Data) -> HEVCConfigurationRecord? {
+        let bytes = [UInt8](data)
+        var result: HEVCConfigurationRecord?
+        bytes.withUnsafeBufferPointer { buffer in
+            HEVCNALUnits.scan(buffer, framing: .annexB, codec: .hevc) { type, payload in
+                guard result == nil, type == 33 else { return }
+                let rbsp = HEVCNALUnits.unescaped(payload)
+                // sps_video_parameter_set_id (4), sps_max_sub_layers_minus1
+                // (3), and sps_temporal_id_nesting_flag (1) consume byte 0.
+                // general_profile_tier_level is then byte-aligned: 1 byte of
+                // profile/tier/idc, 4 compatibility bytes, 6 constraint bytes
+                // and 1 level byte.
+                guard rbsp.count >= 13 else { return }
+                var constraints: UInt64 = 0
+                for index in 6...11 { constraints = (constraints << 8) | UInt64(rbsp[index]) }
+                result = .init(
+                    profileSpace: (rbsp[1] & 0xC0) >> 6,
+                    tierFlag: (rbsp[1] & 0x20) >> 5,
+                    profileIDC: rbsp[1] & 0x1F,
+                    profileCompatibilityFlags: UInt32(rbsp[2]) << 24 | UInt32(rbsp[3]) << 16
+                        | UInt32(rbsp[4]) << 8 | UInt32(rbsp[5]),
+                    constraintIndicatorFlags: constraints,
+                    levelIDC: rbsp[12]
+                )
+            }
+        }
+        return result
+    }
 }
 
 /// The three `avcC` bytes an H.264 `CODECS` string is made of.
@@ -474,10 +509,22 @@ public struct VideoTrackInfo: Sendable, Equatable {
 /// a second HEVC stream belongs to the selected video.  The remuxer consumes
 /// the enhancement stream; it is never exposed as another playable variant.
 struct DolbyVisionSeparateTrackPair: Sendable, Equatable {
+    enum Carriage: Sendable, Equatable {
+        /// Matroska/MP4 packet payloads with their hvcC length prefixes.
+        case lengthPrefixed(base: Int, enhancement: Int)
+        /// M2TS packet payloads remain Annex-B until FFmpeg's MP4 muxer
+        /// constructs the fMP4 sample entry.
+        case annexB(M2TSDolbyVisionAssociation)
+    }
+
     let baseStreamIndex: Int
     let enhancementStreamIndex: Int
-    let baseNALUnitLengthSize: Int
-    let enhancementNALUnitLengthSize: Int
+    let carriage: Carriage
+    /// The EL's declared P7 record.  M2TS BLs legitimately carry no dvcC, so
+    /// the converted output configuration belongs to the proven companion.
+    let enhancementDolbyVision: DolbyVisionConfiguration
+    /// `hvcC` for Matroska, or a strictly validated M2TS HEVC descriptor.
+    let hevcConfiguration: HEVCConfigurationRecord
 }
 
 public struct AudioTrackInfo: Sendable, Equatable {
@@ -1058,7 +1105,8 @@ public enum SourceProbe {
     ///   call must not: its context's read position is the remux.
     static func describe(
         input: UnsafeMutablePointer<AVFormatContext>,
-        verifyingInterlace: Bool = false
+        verifyingInterlace: Bool = false,
+        m2tsDolbyVisionAssociation: M2TSDolbyVisionAssociation? = nil
     ) -> SourceInfo {
         let formatName = input.pointee.iformat.flatMap { $0.pointee.name }
             .map { String(cString: $0) } ?? "unknown"
@@ -1068,6 +1116,8 @@ public enum SourceProbe {
 
         var video: VideoTrackInfo?
         var videoTracks: [VideoTrackInfo] = []
+        var videoPIDs: [Int: Int] = [:]
+        var m2tsInBandHEVCConfigurations: [Int: HEVCConfigurationRecord] = [:]
         var audio: [AudioTrackInfo] = []
         var subtitles: [SubtitleTrackInfo] = []
 
@@ -1102,6 +1152,14 @@ public enum SourceProbe {
                     verifiedFieldOrder: verifiedFieldOrder
                 )
                 videoTracks.append(track)
+                videoPIDs[track.streamIndex] = Int(stream.pointee.id)
+                if par.codec_id == AV_CODEC_ID_HEVC,
+                   let extradata = par.extradata, par.extradata_size > 0,
+                   let configuration = HEVCConfigurationRecord.parseM2TSInBandSPS(
+                       extradata: Data(bytes: extradata, count: Int(par.extradata_size))
+                   ) {
+                    m2tsInBandHEVCConfigurations[track.streamIndex] = configuration
+                }
                 if Int32(index) == bestVideoIndex { video = track }
             case AVMEDIA_TYPE_AUDIO:
                 audio.append(makeAudioInfo(streamIndex: index, stream: stream))
@@ -1112,7 +1170,14 @@ public enum SourceProbe {
             }
         }
 
-        let separatePair = separateTrackPair(formatName: formatName, allVideoTracks: videoTracks)
+        let separatePair = m2tsDolbyVisionAssociation.flatMap {
+            m2tsSeparateTrackPair(
+                formatName: formatName, allVideoTracks: videoTracks,
+                videoPIDs: videoPIDs,
+                inBandHEVCConfigurations: m2tsInBandHEVCConfigurations,
+                association: $0
+            )
+        } ?? separateTrackPair(formatName: formatName, allVideoTracks: videoTracks)
         let ambiguousSeparateTrack = separatePair == nil
             && videoTracks.count > 1
             && videoTracks.contains(where: isSeparateTrackBase)
@@ -1154,14 +1219,60 @@ public enum SourceProbe {
         guard let enhancement = allVideoTracks.first(where: { $0.streamIndex != base.streamIndex }),
               isSeparateTrackEnhancement(enhancement, for: base),
               let baseLengthSize = base.nalUnitLengthSize,
-              let lengthSize = enhancement.nalUnitLengthSize
+              let lengthSize = enhancement.nalUnitLengthSize,
+              let enhancementDV = enhancement.dolbyVision
         else { return nil }
 
         return .init(
             baseStreamIndex: base.streamIndex,
             enhancementStreamIndex: enhancement.streamIndex,
-            baseNALUnitLengthSize: baseLengthSize,
-            enhancementNALUnitLengthSize: lengthSize
+            carriage: .lengthPrefixed(base: baseLengthSize, enhancement: lengthSize),
+            enhancementDolbyVision: enhancementDV,
+            hevcConfiguration: base.hevcConfiguration!
+        )
+    }
+
+    /// MPEG-TS does carry the dependency relationship, but only in the PMT:
+    /// stream order (and FFmpeg's best-stream answer) is not one.  The strict
+    /// PSI reader has already established one program and one explicit EL →
+    /// BL PID.  Bind both IDs back to FFmpeg's actual streams before packets
+    /// are routed, and keep this deliberately narrower than the Matroska
+    /// fallback: exactly two real video tracks, Annex-B HEVC Main 10 BL, and
+    /// the complementary P7 EL record.
+    private static func m2tsSeparateTrackPair(
+        formatName: String,
+        allVideoTracks: [VideoTrackInfo],
+        videoPIDs: [Int: Int],
+        inBandHEVCConfigurations: [Int: HEVCConfigurationRecord],
+        association: M2TSDolbyVisionAssociation
+    ) -> DolbyVisionSeparateTrackPair? {
+        guard formatName.split(separator: ",").contains("mpegts"),
+              allVideoTracks.count == 2,
+              let base = allVideoTracks.first(where: { videoPIDs[$0.streamIndex] == association.basePID }),
+              let enhancement = allVideoTracks.first(where: { videoPIDs[$0.streamIndex] == association.enhancementPID }),
+              base.streamIndex != enhancement.streamIndex,
+              base.codecName == "hevc", base.bitDepth == 10,
+              base.frameRate != nil,
+              enhancement.codecName == "hevc",
+              let enhancementRate = enhancement.frameRate,
+              let baseRate = base.frameRate,
+              abs(enhancementRate - baseRate) < 0.001,
+              let dv = enhancement.dolbyVision,
+              dv.versionMajor == 1, dv.versionMinor == 0,
+              dv.profile == association.profile, dv.level == association.level,
+              dv.rpuPresent, dv.enhancementLayerPresent, !dv.baseLayerPresent,
+              dv.baseLayerSignalCompatibilityID == association.compatibilityID,
+              inBandHEVCConfigurations[base.streamIndex] == association.baseHEVCConfiguration,
+              inBandHEVCConfigurations[enhancement.streamIndex]
+                  == association.enhancementHEVCConfiguration
+        else { return nil }
+
+        return .init(
+            baseStreamIndex: base.streamIndex,
+            enhancementStreamIndex: enhancement.streamIndex,
+            carriage: .annexB(association),
+            enhancementDolbyVision: dv,
+            hevcConfiguration: association.baseHEVCConfiguration
         )
     }
 

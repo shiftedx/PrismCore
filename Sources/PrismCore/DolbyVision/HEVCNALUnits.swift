@@ -79,6 +79,64 @@ enum HEVCNALUnits {
         return units.isEmpty ? nil : units
     }
 
+    /// The strict counterpart to `scan`: pairing is a rewrite boundary, so an
+    /// Annex-B packet has to delimit every NAL exactly before it can be used as
+    /// a Profile 7 BL or EL access unit.  The MPEG-TS demuxer supplies this
+    /// framing, while the MP4 muxer later performs the ordinary Annex-B →
+    /// fMP4 conversion; PrismCore never fabricates a length-prefixed payload.
+    static func strictUnits(
+        in bytes: UnsafeBufferPointer<UInt8>, framing: Framing
+    ) -> [Unit]? {
+        switch framing {
+        case let .lengthPrefixed(lengthSize):
+            return units(in: bytes, lengthSize: lengthSize)
+        case .annexB:
+            guard let base = bytes.baseAddress, bytes.count >= 4 else { return nil }
+
+            func startCodeLength(at offset: Int) -> Int? {
+                guard offset + 3 <= bytes.count,
+                      base[offset] == 0, base[offset + 1] == 0 else { return nil }
+                if base[offset + 2] == 1 { return 3 }
+                guard offset + 4 <= bytes.count, base[offset + 2] == 0, base[offset + 3] == 1 else {
+                    return nil
+                }
+                return 4
+            }
+
+            guard let firstLength = startCodeLength(at: 0) else { return nil }
+            var unitStart = firstLength
+            var cursor = firstLength
+            var result: [Unit] = []
+            while cursor < bytes.count {
+                guard let markerLength = startCodeLength(at: cursor) else {
+                    cursor += 1
+                    continue
+                }
+                var end = cursor
+                while end > unitStart, base[end - 1] == 0 { end -= 1 }
+                guard end - unitStart > 1 else { return nil }
+                let header0 = base[unitStart]
+                let header1 = base[unitStart + 1]
+                result.append(.init(
+                    type: (header0 >> 1) & 0x3F,
+                    layerID: ((header0 & 0x01) << 5) | (header1 >> 3),
+                    bytes: .init(start: base + unitStart, count: end - unitStart)
+                ))
+                cursor += markerLength
+                unitStart = cursor
+            }
+            guard unitStart < bytes.count, bytes.count - unitStart > 1 else { return nil }
+            let header0 = base[unitStart]
+            let header1 = base[unitStart + 1]
+            result.append(.init(
+                type: (header0 >> 1) & 0x3F,
+                layerID: ((header0 & 0x01) << 5) | (header1 >> 3),
+                bytes: .init(start: base + unitStart, count: bytes.count - unitStart)
+            ))
+            return result.isEmpty ? nil : result
+        }
+    }
+
     /// What the rewriter should do with one NAL unit.
     enum Disposition {
         case keep
