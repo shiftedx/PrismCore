@@ -509,10 +509,47 @@ struct ProducerLeadCapTests {
     /// coordinator paces on (the cap itself is expressed in seconds).
     private var leadSegments: Int { Int(DemandCoordinator.producerLeadSeconds / 6) }
 
-    @Test("Before the first fetch the producer never parks — startup must produce")
-    func startupDoesNotPark() {
+    @Test("Before the first fetch an unplanned producer never parks — startup must produce")
+    func unplannedStartupDoesNotPark() {
         let coordinator = DemandCoordinator()
         let returned = park(on: coordinator, producing: 100)
+        #expect(returned.wait(timeout: signalWindow) == .success)
+    }
+
+    @Test("A planned producer caps pre-player work at its head, without inventing a playhead")
+    func plannedStartupParksAndFirstDeepDemandReanchors() {
+        let coordinator = DemandCoordinator()
+        coordinator.publish(plan: SegmentPlan(
+            entries: (0..<20).map { .init(startPTS: Int64($0) * 6000, duration: 6) },
+            basis: .keyframeIndex, timeBaseNum: 1, timeBaseDen: 1000
+        ))
+        coordinator.setProducing(index: 6)
+        let returned = park(on: coordinator, producing: 6)
+
+        #expect(returned.wait(timeout: stillParkedWindow) == .timedOut,
+                "36 s of planned lead must park before AVPlayer fetches")
+        #expect(coordinator.playheadIndex == nil, "the startup anchor is not a fetch")
+
+        coordinator.noteFetch(of: 12)
+        coordinator.requestProduction(of: 12)
+        #expect(returned.wait(timeout: signalWindow) == .success)
+        #expect(coordinator.takeAnchorRequest() == 12)
+    }
+
+    @Test("Cancellation releases a pre-player planned lead cap")
+    func cancellationReleasesPlannedStartupPark() {
+        let coordinator = DemandCoordinator()
+        coordinator.publish(plan: SegmentPlan(
+            entries: (0..<20).map { .init(startPTS: Int64($0) * 6000, duration: 6) },
+            basis: .keyframeIndex, timeBaseNum: 1, timeBaseDen: 1000
+        ))
+        let cancelled = LockedFlag()
+        let returned = park(on: coordinator, producing: 6, isCancelled: { cancelled.isSet })
+
+        #expect(returned.wait(timeout: stillParkedWindow) == .timedOut,
+                "the planned producer must be parked before cancellation")
+        cancelled.set()
+        coordinator.wake()
         #expect(returned.wait(timeout: signalWindow) == .success)
     }
 
