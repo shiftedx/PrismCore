@@ -258,6 +258,9 @@ extension SuppliedKeyframeMap {
             guard offsets.allSatisfy({ $0 >= 0 && $0 < size && $0 % 192 == 0 }) else {
                 return .outOfBounds("packet offset is outside the M2TS representation")
             }
+            guard !zip(offsets, offsets.dropFirst()).contains(where: { earlier, later in later < earlier }) else {
+                return .malformedMap("packet offsets are not ordered with keyframe timestamps")
+            }
         default:
             return .malformedMap("packet offsets require the source size")
         }

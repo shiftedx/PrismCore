@@ -272,6 +272,12 @@ struct SourceOpenHintsTests {
             transportPID: 0x1011, sourceSize: 192 * 10,
             packetOffsets: [0, 192 * 3, 192 * 10]
         ).validate(against: facts()) != nil)
+        #expect(SuppliedKeyframeMap(
+            streamIndex: 0, timeBaseNum: 1, timeBaseDen: 1000,
+            keyframePTS: [0, 2000, 4000], completeness: .complete,
+            transportPID: 0x1011, sourceSize: 192 * 10,
+            packetOffsets: [0, 192 * 8, 192 * 3]
+        ).validate(against: facts()) != nil)
     }
 
     @Test("Timestamps outside the stream's own span reject the whole map")
