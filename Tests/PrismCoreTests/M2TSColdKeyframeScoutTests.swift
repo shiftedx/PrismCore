@@ -11,52 +11,107 @@ import Testing
 )
 struct M2TSColdKeyframeScoutTests {
 
-    @Test("a witnessed base-layer prefix starts at the real head IRAP and leaves the context there")
-    func witnessedHeadPrefixIsUsableAfterRewind() throws {
+    @Test("a complete sparse map starts at the real head IRAP and leaves the context there")
+    func completeMapIsUsableAfterRewind() throws {
         var opened = try openFixture()
         defer { avformat_close_input(&opened.context) }
         let stream = try #require(opened.context?.pointee.streams[1])
 
-        let result = M2TSColdKeyframeScout.scan(
+        let result = M2TSColdKeyframeScout.completeSparsePlan(
             input: try #require(opened.context), baseStreamIndex: 1,
-            timeBase: stream.pointee.time_base, interruptGuard: opened.guardBox
+            timeBase: stream.pointee.time_base,
+            timelineEndPTS: stream.pointee.start_time + stream.pointee.duration,
+            targetSeconds: 6, firstSegmentSeconds: SegmentPlan.defaultFirstSegmentSeconds,
+            interruptGuard: opened.guardBox
         )
-        guard case let .success(keyframes, coveredThrough) = result else {
-            Issue.record("Expected an observed cold keyframe prefix, got \(result)")
+        guard case let .complete(keyframes) = result else {
+            Issue.record("Expected a complete observed cold keyframe map, got \(result)")
             return
         }
         #expect(!result.rewindRequired)
         let first = try #require(keyframes.first)
         #expect(first == 7_500)
-        #expect(coveredThrough == keyframes.last)
-        #expect(
-            (Double(coveredThrough) - Double(first))
-                * av_q2d(stream.pointee.time_base) >= Double(SegmentPlan.witnessSeconds)
-        )
+        #expect(keyframes.count > 2)
         #expect(try firstBaseIRAP(in: try #require(opened.context), streamIndex: 1) == 7_500)
     }
 
-    @Test("a byte or clock-starved scout never publishes a partial map")
+    @Test("a byte or clock-starved sparse proof never publishes a map")
     func boundedScoutFallsBackWithoutMap() throws {
         var byteStarved = try openFixture()
         defer { avformat_close_input(&byteStarved.context) }
         let byteStream = try #require(byteStarved.context?.pointee.streams[1])
-        let byteResult = M2TSColdKeyframeScout.scan(
+        let byteResult = M2TSColdKeyframeScout.completeSparsePlan(
             input: try #require(byteStarved.context), baseStreamIndex: 1,
-            timeBase: byteStream.pointee.time_base, interruptGuard: byteStarved.guardBox,
+            timeBase: byteStream.pointee.time_base,
+            timelineEndPTS: byteStream.pointee.start_time + byteStream.pointee.duration,
+            targetSeconds: 6, firstSegmentSeconds: SegmentPlan.defaultFirstSegmentSeconds,
+            interruptGuard: byteStarved.guardBox,
             byteBudget: 1
         )
-        assertNoMap(byteResult)
+        assertInsufficient(byteResult)
 
         var clockStarved = try openFixture()
         defer { avformat_close_input(&clockStarved.context) }
         let clockStream = try #require(clockStarved.context?.pointee.streams[1])
-        let clockResult = M2TSColdKeyframeScout.scan(
+        let clockResult = M2TSColdKeyframeScout.completeSparsePlan(
             input: try #require(clockStarved.context), baseStreamIndex: 1,
-            timeBase: clockStream.pointee.time_base, interruptGuard: clockStarved.guardBox,
+            timeBase: clockStream.pointee.time_base,
+            timelineEndPTS: clockStream.pointee.start_time + clockStream.pointee.duration,
+            targetSeconds: 6, firstSegmentSeconds: SegmentPlan.defaultFirstSegmentSeconds,
+            interruptGuard: clockStarved.guardBox,
             timeBudget: .zero
         )
-        assertNoMap(clockResult)
+        assertInsufficient(clockResult)
+
+        var cancelled = try openFixture()
+        defer { avformat_close_input(&cancelled.context) }
+        let cancelledStream = try #require(cancelled.context?.pointee.streams[1])
+        cancelled.guardBox.cancel()
+        let cancelledResult = M2TSColdKeyframeScout.completeSparsePlan(
+            input: try #require(cancelled.context), baseStreamIndex: 1,
+            timeBase: cancelledStream.pointee.time_base,
+            timelineEndPTS: cancelledStream.pointee.start_time + cancelledStream.pointee.duration,
+            targetSeconds: 6, firstSegmentSeconds: SegmentPlan.defaultFirstSegmentSeconds,
+            interruptGuard: cancelled.guardBox
+        )
+        guard case .cancelled = cancelledResult else {
+            Issue.record("Expected cancellation to remain distinct from an insufficient proof, got \(cancelledResult)")
+            return
+        }
+
+        let source = try Data(contentsOf: URL(fileURLWithPath: try fixturePath()))
+        // Begin away from the head and delay each later read until the sparse proof expires.
+        // A healthy seekable input must still restore the proven BL head for sequential fallback.
+        let delayedInput = ScoutFaultingInput(data: source)
+        let delayedGuard = ReadInterruptGuard()
+        var delayedContext: UnsafeMutablePointer<AVFormatContext>? = delayedGuard.makeContext()
+        try delayedGuard.installCustomInput(on: try #require(delayedContext), factory: { delayedInput })
+        try FFmpegError.check(
+            avformat_open_input(&delayedContext, nil, nil, nil), "open delayed sparse-proof custom input"
+        )
+        defer { avformat_close_input(&delayedContext) }
+        let delayedOpened = try #require(delayedContext)
+        try FFmpegError.check(
+            avformat_find_stream_info(delayedOpened, nil), "read delayed sparse-proof custom input"
+        )
+        let delayedStream = try #require(delayedOpened.pointee.streams[1])
+        #expect(av_seek_frame(
+            delayedOpened, 1, delayedStream.pointee.start_time + delayedStream.pointee.duration / 2,
+            AVSEEK_FLAG_BACKWARD
+        ) >= 0)
+        avformat_flush(delayedOpened)
+        delayedInput.delayFutureReads(by: .milliseconds(1))
+        let expiredDuringProbe = M2TSColdKeyframeScout.completeSparsePlan(
+            input: delayedOpened, baseStreamIndex: 1, timeBase: delayedStream.pointee.time_base,
+            timelineEndPTS: delayedStream.pointee.start_time + delayedStream.pointee.duration,
+            targetSeconds: 6, firstSegmentSeconds: SegmentPlan.defaultFirstSegmentSeconds,
+            interruptGuard: delayedGuard, timeBudget: .milliseconds(10)
+        )
+        guard case .insufficient(rewindRequired: false) = expiredDuringProbe else {
+            Issue.record("A healthy deadline-expired sparse probe must restore the head, got \(expiredDuringProbe)")
+            return
+        }
+        #expect(try firstBaseIRAP(in: delayedOpened, streamIndex: 1) == 7_500)
     }
 
     @Test("a host input that dies after open remains an I/O failure")
@@ -79,8 +134,10 @@ struct M2TSColdKeyframeScoutTests {
         let stream = try #require(opened.pointee.streams[1])
         input.failSubsequentReads()
 
-        let result = M2TSColdKeyframeScout.scan(
+        let result = M2TSColdKeyframeScout.completeSparsePlan(
             input: opened, baseStreamIndex: 1, timeBase: stream.pointee.time_base,
+            timelineEndPTS: stream.pointee.start_time + stream.pointee.duration,
+            targetSeconds: 6, firstSegmentSeconds: SegmentPlan.defaultFirstSegmentSeconds,
             interruptGuard: guardBox
         )
         guard case let .ioFailure(code, _, _) = result else {
@@ -91,9 +148,10 @@ struct M2TSColdKeyframeScoutTests {
         #expect(guardBox.customInputFailure != nil)
     }
 
-    private func assertNoMap(_ result: M2TSColdKeyframeScout.Result) {
-        if case .success = result {
-            Issue.record("A budget-starved scout published a keyframe map")
+    private func assertInsufficient(_ result: M2TSColdKeyframeScout.CompleteResult) {
+        guard case .insufficient = result else {
+            Issue.record("A budget-starved scout must be insufficient, got \(result)")
+            return
         }
     }
 
@@ -147,6 +205,7 @@ private final class ScoutFaultingInput: PrismCoreInput, @unchecked Sendable {
     private let lock = NSLock()
     private var position = 0
     private var failReads = false
+    private var readDelay: Duration?
 
     init(data: Data) { bytes = [UInt8](data) }
 
@@ -156,8 +215,13 @@ private final class ScoutFaultingInput: PrismCoreInput, @unchecked Sendable {
         lock.withLock { failReads = true }
     }
 
+    func delayFutureReads(by duration: Duration) {
+        lock.withLock { readDelay = duration }
+    }
+
     func read(into buffer: UnsafeMutableRawBufferPointer) throws -> Int {
-        try lock.withLock {
+        if let delay = lock.withLock({ readDelay }) { Thread.sleep(forTimeInterval: delay.seconds) }
+        return try lock.withLock {
             if failReads { throw Broken() }
             let count = min(buffer.count, bytes.count - position)
             guard count > 0 else { return 0 }

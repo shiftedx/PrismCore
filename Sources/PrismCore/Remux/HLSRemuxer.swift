@@ -1258,11 +1258,24 @@ final class HLSRemuxer: @unchecked Sendable {
         // in a separate namespace so an ordinary MPEG-TS play can never lend
         // it an untrusted demuxer index.
         let cacheIdentity = baseCacheIdentity.map {
-            // v2 requires the PMT-selected BL stream on every head rewind.
-            // v1 could harvest after FFmpeg's default (often EL) stream
-            // skipped the opening BL GOP, so it is not equivalent evidence.
-            requireDolbyVisionTransportPairing ? "\($0)|m2ts-dv-packet-keys-v2" : $0
+            // v3 accepts only a complete observed map for strict M2TS VOD. v2 could persist a
+            // prefix that the old planner extended with inferred tail cadence.
+            requireDolbyVisionTransportPairing ? "\($0)|m2ts-dv-packet-keys-v3" : $0
         }
+        let m2tsTimelineEndPTS: Int64? = {
+            guard requireDolbyVisionTransportPairing else { return nil }
+            let stream = input.pointee.streams[Int(videoIndex)]!.pointee
+            if stream.start_time != swift_AV_NOPTS_VALUE(), stream.duration > 0 {
+                return stream.start_time + stream.duration
+            }
+            guard input.pointee.start_time != swift_AV_NOPTS_VALUE(), input.pointee.duration > 0 else {
+                return nil
+            }
+            return av_rescale_q(
+                input.pointee.start_time + input.pointee.duration,
+                AVRational(num: 1, den: AV_TIME_BASE), stream.time_base
+            )
+        }()
         // A previous play's harvested keyframe map, when its time base still
         // matches the stream's. It replaces the demuxer index in the plan —
         // and skips the index-load seek, so a cache hit starts faster than
@@ -1279,7 +1292,8 @@ final class HLSRemuxer: @unchecked Sendable {
             else { return nil }
             let timeBase = input.pointee.streams[Int(videoIndex)]!.pointee.time_base
             guard entry.timeBaseNum == timeBase.num, entry.timeBaseDen == timeBase.den,
-                  entry.keyframePTS.count >= 2
+                  entry.keyframePTS.count >= 2,
+                  !requireDolbyVisionTransportPairing || entry.complete
             else { return nil }
             return entry
         }()
@@ -1290,76 +1304,81 @@ final class HLSRemuxer: @unchecked Sendable {
 
         // MPEG-TS's generic timestamp index is made from PCR/seek anchors. It
         // can point between HEVC pictures, so a strict transport-DV session
-        // must never turn it into a segment promise. On a cold play, observe a
-        // short contiguous head prefix of *actual* base-layer IRAPs instead.
+        // must never turn it into a segment promise. On a cold play, it proves
+        // complete sparse *actual* base-layer IRAP segment anchors instead.
         // This is deliberately only current-session evidence: normal packet
         // harvesting remains the sole route that persists a map.
         var planningKeyframes = cachedKeyframes
-        var planningCoveredThrough = cachedCoveredThrough
+        let planningCoveredThrough = cachedCoveredThrough
         var scoutRewoundToHead = false
+        var observedM2TSPlan: [SegmentPlan.Entry]?
         if requireDolbyVisionTransportPairing, demandEligible, planningKeyframes == nil {
             let stream = input.pointee.streams[Int(videoIndex)]!
-            let scout = M2TSColdKeyframeScout.scan(
-                input: input, baseStreamIndex: videoIndex, timeBase: stream.pointee.time_base,
-                interruptGuard: interruptGuard
-            )
-            switch scout {
-            case let .success(keyframes, coveredThrough):
-                planningKeyframes = keyframes
-                planningCoveredThrough = coveredThrough
-                scoutRewoundToHead = true
-            case .insufficient(rewindRequired: false):
-                // No head-prefix witness is safe to publish. Retain the
-                // existing sequential behavior rather than falling back to
-                // the transport's PCR index.
-                break
-            case .cancelled(rewindRequired: false) where cancelled.isSet:
-                return
-            case .cancelled(rewindRequired: false):
-                throw sourceFailure(
-                    code: swift_AVERROR_EXIT(), operation: "M2TS cold keyframe scout cancelled"
+            if let m2tsTimelineEndPTS {
+                let scout = M2TSColdKeyframeScout.completeSparsePlan(
+                    input: input, baseStreamIndex: videoIndex, timeBase: stream.pointee.time_base,
+                    timelineEndPTS: m2tsTimelineEndPTS, targetSeconds: segmentSeconds,
+                    firstSegmentSeconds: firstSegmentSeconds, interruptGuard: interruptGuard
                 )
-            case let .ioFailure(code, operation, _):
-                throw sourceFailure(code: code, operation: operation)
-            case .insufficient, .cancelled:
-                // The scout moved this AVFormatContext but could not put it
-                // back at the head. Continuing from an unknown cursor could
-                // silently omit the opening configuration/AUs.
-                throw sourceFailure(
-                    code: swift_AVERROR_EXIT(), operation: "M2TS cold keyframe scout head restore"
-                )
+                switch scout {
+                case let .complete(anchors):
+                    observedM2TSPlan = SegmentPlan.observedAnchorPlan(
+                        anchors: anchors, timelineEndPTS: m2tsTimelineEndPTS,
+                        tickSeconds: av_q2d(stream.pointee.time_base)
+                    )
+                    scoutRewoundToHead = true
+                case .insufficient(rewindRequired: false):
+                    // A strict immutable VOD can only name observed BL IRAPs. A bounded proof that
+                    // did not reach EOF stays sequential rather than borrowing a tail cadence.
+                    break
+                case .cancelled(rewindRequired: false) where cancelled.isSet:
+                    return
+                case .cancelled(rewindRequired: false):
+                    throw sourceFailure(
+                        code: swift_AVERROR_EXIT(), operation: "M2TS cold keyframe scout cancelled"
+                    )
+                case let .ioFailure(code, operation, _):
+                    throw sourceFailure(code: code, operation: operation)
+                case .insufficient, .cancelled:
+                    // The scout moved this AVFormatContext but could not put it
+                    // back at the head. Continuing from an unknown cursor could
+                    // silently omit the opening configuration/AUs.
+                    throw sourceFailure(
+                        code: swift_AVERROR_EXIT(), operation: "M2TS cold keyframe scout head restore"
+                    )
+                }
+            } else {
+                // A transport length without an absolute stream endpoint cannot be an immutable
+                // VOD promise. The ordinary sequential route remains valid.
+                planningKeyframes = nil
             }
         }
 
         // Do not even ask FFmpeg to load its transport index in strict M2TS
         // mode: a scout/cache miss is intentionally sequential, while a
-        // witnessed packet map is passed as a partial keyframe map.
-        let m2tsTimelineEndPTS: Int64? = {
-            guard requireDolbyVisionTransportPairing else { return nil }
-            let stream = input.pointee.streams[Int(videoIndex)]!.pointee
-            if stream.start_time != swift_AV_NOPTS_VALUE(), stream.duration > 0 {
-                return stream.start_time + stream.duration
-            }
-            guard input.pointee.start_time != swift_AV_NOPTS_VALUE(), input.pointee.duration > 0 else {
-                return nil
-            }
-            return av_rescale_q(
-                input.pointee.start_time + input.pointee.duration,
-                AVRational(num: 1, den: AV_TIME_BASE), stream.time_base
+        // complete observed-anchor map becomes an immutable VOD plan.
+        let (builtPlan, planRewoundToHead): (SegmentPlan?, Bool)
+        if let observedM2TSPlan {
+            let timeBase = input.pointee.streams[Int(videoIndex)]!.pointee.time_base
+            builtPlan = SegmentPlan(
+                entries: observedM2TSPlan, basis: .keyframeIndex,
+                timeBaseNum: timeBase.num, timeBaseDen: timeBase.den,
+                indexCoversEnd: true
             )
-        }()
-        let (builtPlan, planRewoundToHead): (SegmentPlan?, Bool) = demandEligible
-            ? (requireDolbyVisionTransportPairing && planningKeyframes == nil
-                ? (nil, false)
-                : SegmentPlan.buildReportingPosition(
+            planRewoundToHead = false
+        } else if demandEligible, !(requireDolbyVisionTransportPairing && planningKeyframes == nil) {
+            (builtPlan, planRewoundToHead) = SegmentPlan.buildReportingPosition(
                     input: input, videoStreamIndex: videoIndex, targetSeconds: segmentSeconds,
                     firstSegmentSeconds: firstSegmentSeconds,
                     indexLoadBudget: indexLoadBudget,
                     interruptGuard: interruptGuard, cachedKeyframes: planningKeyframes,
                     cachedCoveredThroughPTS: planningCoveredThrough,
                     timelineEndPTS: m2tsTimelineEndPTS
-                ))
-            : (nil, false)
+                )
+        } else {
+            builtPlan = nil
+            planRewoundToHead = false
+        }
         if needsRewindToHead, !planRewoundToHead, !scoutRewoundToHead {
             // The plan did not pass through the head (cached map, an index
             // loaded at open, or no plan at all): rewind the adopted context
@@ -1385,7 +1404,7 @@ final class HLSRemuxer: @unchecked Sendable {
         // harvests real packet keyframes; publishing a demand plan from this
         // index created a phantom tail segment that no source keyframe could
         // open. Matroska and ordinary M2TS retain their existing plan policy.
-        let plannedPlan: SegmentPlan? = (!requireDolbyVisionTransportPairing || planningKeyframes != nil)
+        let plannedPlan: SegmentPlan? = (!requireDolbyVisionTransportPairing || planningKeyframes != nil || observedM2TSPlan != nil)
             && builtPlan?.basis == .keyframeIndex ? builtPlan : nil
         builtPlanLock.withLock { builtPlanStorage = builtPlan }
         let planIsPartial = plannedPlan != nil && planningCoveredThrough != nil
@@ -2605,6 +2624,14 @@ final class HLSRemuxer: @unchecked Sendable {
                         }
                         guard try pairer.isBaseIRAP(packet) else {
                             continue
+                        }
+                        // A strict VOD plan names this exact observed IRAP. PCR seeking may land
+                        // nearby, but accepting the next one would put a correct fragment in the
+                        // wrong immutable slot and make every later EXTINF lie.
+                        guard sourcePTS == target else {
+                            throw FFmpegError(
+                                code: swift_AVERROR(EINVAL), operation: "M2TS exact IRAP reanchor"
+                            )
                         }
                         // Drop only packets that precede this real candidate;
                         // an EL at the same PTS may already be buffered.

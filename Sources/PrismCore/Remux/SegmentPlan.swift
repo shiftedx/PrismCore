@@ -488,6 +488,28 @@ struct SegmentPlan: Equatable {
         return entries.isEmpty ? nil : entries
     }
 
+    /// A complete VOD map assembled from observed segment-opening IRAPs. This is deliberately
+    /// separate from `keyframePlan`: a sparse transport proof has no right to invent the IRAPs
+    /// between its selected anchors, while its actual anchors already describe every immutable
+    /// `EXTINF` exactly.
+    static func observedAnchorPlan(
+        anchors: [Int64], timelineEndPTS: Int64, tickSeconds: Double
+    ) -> [Entry]? {
+        guard anchors.count >= 2, timelineEndPTS > anchors[anchors.count - 1],
+              tickSeconds.isFinite, tickSeconds > 0
+        else { return nil }
+        var entries: [Entry] = []
+        for (start, end) in zip(anchors, anchors.dropFirst()) {
+            let gap = Double(end - start) * tickSeconds
+            guard end > start, gap > 0, gap <= maxTrustedGapSeconds else { return nil }
+            entries.append(Entry(startPTS: start, duration: gap))
+        }
+        let tail = Double(timelineEndPTS - anchors[anchors.count - 1]) * tickSeconds
+        guard tail > 0, tail <= maxTrustedGapSeconds else { return nil }
+        entries.append(Entry(startPTS: anchors[anchors.count - 1], duration: tail))
+        return entries
+    }
+
     /// Fixed-stride fallback. Anchored at 0 — a late-starting title is rare
     /// enough that v1 doesn't special-case it (anchoring segment 0 at the
     /// real content start is noted for the hardening pass).

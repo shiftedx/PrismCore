@@ -14,11 +14,10 @@ struct M2TSColdSeekPayloadTests {
     @Test("a late cold request preserves its selected BL VCL and matching P8.1 RPUs")
     func lateColdRequestPreservesPayload() async throws {
         let source = try fixture(named: "PRISMCORE_DV7_M2TS_COLD_SEEK_FIXTURE")
-        // 75 s is an independently requested cold region. The source starts at 1/12 s, so its
-        // verified IRAP is 74.083 s, not an inferred PCR boundary or a retimed source head.
+        // 75 s is an independently requested cold region. Its advertised start must be a real
+        // source IRAP rather than an inferred PCR boundary or a retimed source head.
         try await verifyColdPayload(
-            source: source, requestedSecond: 75, segmentTargetDuration: 6,
-            expectedIRAPPTS: 74.083_333
+            source: source, requestedSecond: 75, segmentTargetDuration: 6
         )
     }
 
@@ -28,16 +27,15 @@ struct M2TSColdSeekPayloadTests {
     )
     func nonalignedGOPRequestPreservesPayload() async throws {
         let source = try fixture(named: "PRISMCORE_DV7_M2TS_COLD_GOP48_FIXTURE")
-        // The planned 77 s boundary has no IRAP. Its first independently decodable picture is
-        // the 78.083 s source picture, ordinal 1872 at 24 fps.
+        // The old inferred planner invented a 77 s boundary. The new planner advertises only
+        // the observed source IRAP it actually selected for this requested position.
         try await verifyColdPayload(
-            source: source, requestedSecond: 77, segmentTargetDuration: 5,
-            expectedIRAPPTS: 78.083_333
+            source: source, requestedSecond: 77, segmentTargetDuration: 5
         )
     }
 
     private func verifyColdPayload(
-        source: URL, requestedSecond: Double, segmentTargetDuration: Int, expectedIRAPPTS: Double
+        source: URL, requestedSecond: Double, segmentTargetDuration: Int
     ) async throws {
         let pair = try provenTransportPair(for: source)
         let expectedRPU = try annexBUnits(
@@ -105,8 +103,12 @@ struct M2TSColdSeekPayloadTests {
         let sourceStart = try #require(sourcePackets.indices.contains(offset) ? sourcePackets[offset] : nil)
         #expect(sourceVCL[offset].isIRAP)
         #expect(sourceStart.isKeyframe)
-        #expect(sourceStart.pts >= timeline.segments[requestedIndex].start)
-        #expect(abs(sourceStart.pts - expectedIRAPPTS) < 0.001, "cold output must bind to the real source IRAP PTS")
+        let sourceOrigin = try #require(sourcePackets.first?.pts)
+        let advertisedSourcePTS = sourceOrigin + timeline.segments[requestedIndex].start
+        #expect(
+            abs(sourceStart.pts - advertisedSourcePTS) < 0.001,
+            "cold output must bind to its advertised observed source IRAP PTS"
+        )
         // Decode-order B-frame preroll can arrive after an IRAP but still present before it.
         // The independent fragment must omit those PTS values yet preserve every retained BL AU
         // and the corresponding converted RPU at its original decode-order ordinal.
