@@ -52,6 +52,51 @@ struct SeparateTrackDolbyVisionTests {
         try await forceReanchor(session: session, master: master)
     }
 
+    @Test("the legacy default AAC rendition remains servable after a forced video re-anchor")
+    func selectedAACSurvivesForcedReanchor() async throws {
+        guard let source = fixtures.first else {
+            throw FixtureError("PRISMCORE_DV7_SEPARATE_FIXTURES must include a MEL fixture")
+        }
+        let session = try PrismCoreSession(
+            url: source,
+            display: .init(isHDRReady: true, isDolbyVisionCapable: true),
+            segmentCacheBytes: 1,
+            segmentTargetDuration: 1
+        )
+        defer { Task { await session.stop() } }
+
+        let master = try await session.start()
+        let masterText = try await fetchText(master)
+        guard masterText.contains("mp4a.40.2"),
+              let audioRelative = PrismCoreSession.playlistURIs(inMaster: masterText).first(where: {
+                  $0.hasPrefix("audio")
+              }),
+              let videoRelative = PrismCoreSession.playlistURIs(inMaster: masterText).last,
+              let audio = URL(string: audioRelative, relativeTo: master)?.absoluteURL,
+              let video = URL(string: videoRelative, relativeTo: master)?.absoluteURL
+        else { throw FixtureError("Missing selected AAC or video rendition") }
+
+        let audioSegments = try await segmentURLs(in: audio)
+        let videoSegments = try await segmentURLs(in: video)
+        guard let firstAudio = audioSegments.first,
+              let lastAudio = audioSegments.last,
+              let firstVideo = videoSegments.first,
+              let lastVideo = videoSegments.last,
+              audioSegments.count >= 8,
+              videoSegments.count >= 8
+        else { throw FixtureError("Fixture did not produce enough selected AAC/video segments") }
+
+        let audioRoot = audio.deletingLastPathComponent()
+        #expect(!(try await fetchData(audioRoot.appendingPathComponent("init.mp4"))).isEmpty)
+        #expect(!(try await fetchData(firstAudio)).isEmpty)
+        #expect(!(try await fetchData(firstVideo)).isEmpty)
+        // A one-byte cache makes this tail request abandon the head and
+        // rebuild all rendition writers at the selected video boundary.
+        #expect(!(try await fetchData(lastVideo)).isEmpty)
+        #expect(!(try await fetchData(lastAudio)).isEmpty)
+        #expect((await session.dolbyVisionConversion)?.isClean == true)
+    }
+
     private func paths(named name: String) -> [URL] {
         (ProcessInfo.processInfo.environment[name] ?? "")
             .split(separator: ":")
@@ -136,6 +181,14 @@ struct SeparateTrackDolbyVisionTests {
             throw FixtureError("Loopback did not serve \(url.lastPathComponent)")
         }
         return data
+    }
+
+    private func segmentURLs(in playlist: URL) async throws -> [URL] {
+        let text = try await fetchText(playlist)
+        return text.split(whereSeparator: \.isNewline).compactMap { line in
+            guard !line.hasPrefix("#"), !line.isEmpty else { return nil }
+            return URL(string: String(line), relativeTo: playlist)?.absoluteURL
+        }
     }
 
     private struct FixtureError: Error, CustomStringConvertible {
